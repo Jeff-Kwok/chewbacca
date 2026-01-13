@@ -10,7 +10,7 @@ from motorfunctions import MotorFunctions
 from .state import RobotState
 from . import config
 from .controller import ControllerModule
-from .camera import CameraModule
+from .stereo_reciever import StereoReceiver
 from .stm32 import STMModule
 from .lidar import LidarModule
 from .core_control import ControlLoop
@@ -33,7 +33,7 @@ async def main():
     sock_desktop = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     ctrl_mod = ControllerModule(sock_ctrl, state)
-    cam_mod = CameraModule(sock_cam, state, motors)
+    stereo_mod = StereoReceiver(sock_cam, state, motors)
     stm_mod = STMModule(config.STM_SERIAL_PORT, config.STM_BAUD, state,sock_desktop,config.SEND_PORT,config.SEND_IP)
     lidar_mod = LidarModule(state)
     core_mod = ControlLoop(state, motors)
@@ -41,7 +41,7 @@ async def main():
     
     await asyncio.gather(
         ctrl_mod.run(),
-        cam_mod.run(),
+        stereo_mod.run(),
         stm_mod.run(),
         lidar_mod.run(),
         core_mod.run(),

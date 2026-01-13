@@ -24,11 +24,6 @@ class ControlLoop:
             if age > config.JOY_TIMEOUT:
                 continue
 
-            if self.state.mode != "controller":
-                if self.state.triggers["RT"] > 0:
-                    self.motors.brake_all_motors(message_toggle=False)
-                continue
-
             if self.state.triggers["RT"] > 0:
                 self.motors.brake_all_motors(message_toggle=False)
                 continue
@@ -41,11 +36,18 @@ class ControlLoop:
             # STM32 Yaw Reading
             yaw = (np.deg2rad(self.state.stm["yaw"])-np.pi/2) % (2*np.pi)
             # Predicted angle reading from controller 
-            angle = (np.arctan2(ry,rx)-np.pi/2) % (2*np.pi)
-            # w,val needs to match
+            if self.state.mode == "controller":
+                # our intended angle should come from our controller when in controller mode
+                angle = (np.arctan2(ry,rx)-np.pi/2) % (2*np.pi)
+                #print(f"stick{angle:.2f}")
+            elif self.state.mode == "camera":
+                angle = self.state.hunted["angle"] %(2*np.pi)
+                #print(f"cam{angle:.2f}")
+                
+            # w,val needs to match iun terms of radians and per measure whether from 0 to 2pi or -pi to pi
             w,val = self.motors.calc_robot_yaw(angle,yaw)
 
-            #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
+            print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
             w_fl, w_fr, w_rl, w_rr = self.motors.calc_norm_vector(x, y, w)
             self.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,

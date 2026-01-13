@@ -23,6 +23,7 @@ class RobotState:
         self.select_state = 1
         self.tracker = 0
         self.hunter = 0
+        self.hunted = {"angle": 0.0, "distance": 0.0}
         
         # Lidar Zone
         self.zone = {"zone": "Far", "x_sum": 0.0, "y_sum": 0.0}
