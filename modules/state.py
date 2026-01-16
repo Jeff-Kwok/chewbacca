@@ -15,17 +15,27 @@ class RobotState:
             "A": 0, "B": 0, "X": 0, "Y": 0,
             "DPAD_UP": 0, "DPAD_DOWN": 0,
             "DPAD_LEFT": 0, "DPAD_RIGHT": 0,
+            "LB": 0, "RB" :0,
         }
         self.last_joy_time = 0.0
         
         # High Level State
-        self.mode = "controller" # "controller" or "camera"
-        self.camera_mode = "hunting" # "hunting" or "tagging"
-        self.select_state = 1
-        self.tracker = 0
-        self.hunter = 0
+        self.robot_modes = ["Rest","Manual","Follower","Tag"]
+        self.robot_current = 0
+        self.toggle = 0
+
+        self.camera_modes = ["Rest","Yolo","AprilTag"] # "hunting" or "tagging"
+        self.camera_current = 0
         self.hunted = {"angle": 0.0, "distance": 0.0}
         
+        # April Tag Behavior List
+        self.behavior_modes = ["Rest","Docking","Lost","Hunting","Centering"]
+        self.behavior_current = 0
+        self.tag_sequence = []
+        self.tag_discovery = []
+        self.tag_current = 0
+
+
         # Lidar Zone
         self.zone = {"zone": "Far", "x_sum": 0.0, "y_sum": 0.0}
         # Lidar Close Data (Points <= close distance)

@@ -4,8 +4,7 @@ import numpy as np
 from dt_apriltags import Detector
 
 detector = Detector(
-    searchpath=['/usr/local/lib'],  # optional; can omit
-    families='tagCircle49h12',
+    families='tagStandard41h12',
     nthreads=4,
     quad_decimate=1.0,
     quad_sigma=0.0,
@@ -14,142 +13,117 @@ detector = Detector(
     debug=0
 )
 
-# --------- CONFIG YOU MUST SET (CALIBRATION) ----------
-# Tag size in METERS (0.16 = 16cm)
-TAG_SIZE_M = 0.166
+TAG_SIZE_M = 0.102
 
-# Replace these with your calibrated intrinsics (pixels)
-# If you don't have them yet, these placeholders will "work" but pose will be wrong-scale/biased.
-FX_L, FY_L = 304.34, 304.34
-FX_R, FY_R = 300.0, 300.0
-# ------------------------------------------------------
+# Replace with calibrated intrinsics for each camera if you have them.
+FX_L, FY_L = 210.0, 210.0
+FX_R, FY_R = 210, 210.0
 
-def split_stereo_side_by_side(frame):
-    """Split a side-by-side stereo frame into (left, right)."""
-    h, w = frame.shape[:2]
+# If you have calibrated principal points, set them here.
+# If None, we'll fall back to w/2,h/2 for each half-image.
+CX_L, CY_L = None, None
+CX_R, CY_R = None, None
+
+
+def split_stereo_side_by_side(frame_gray):
+    h, w = frame_gray.shape[:2]
     mid = w // 2
-    left = frame[:, :mid]
-    right = frame[:, mid:]
+    left = frame_gray[:, :mid]
+    right = frame_gray[:, mid:]
     return left, right, mid
 
-def detect_with_pose(detector, img_bgr_or_gray, fx, fy, tag_size_m):
-    """
-    Returns dict:
-      {tag_id: {"center":(cx,cy), "R":3x3, "t":3x1, "err":float, "det":Detection}}
-    """
-    if img_bgr_or_gray.ndim == 3:
-        gray = cv2.cvtColor(img_bgr_or_gray, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img_bgr_or_gray
 
-    h, w = gray.shape[:2]
-    cx = w / 2.0
-    cy = h / 2.0
+def detect_pose(gray_img, fx, fy, tag_size_m, cx=None, cy=None):
+    """
+    Returns: (detections, camera_params)
+    Each detection d may have: d.pose_R, d.pose_t, d.pose_err, d.corners, d.center, d.tag_id
+    """
+    h, w = gray_img.shape[:2]
+    if cx is None: cx = w / 2.0
+    if cy is None: cy = h / 2.0
     camera_params = (fx, fy, cx, cy)
 
-    detections = detector.detect(
-        gray,
+    dets = detector.detect(
+        gray_img,
         estimate_tag_pose=True,
         camera_params=camera_params,
         tag_size=tag_size_m
     )
+    return dets, camera_params
 
-    out = {}
-    for d in detections:
-        tag_id = int(d.tag_id)
-        out[tag_id] = {
-            "center": (float(d.center[0]), float(d.center[1])),
-            "R": np.array(d.pose_R, dtype=np.float64) if d.pose_R is not None else None,
-            "t": np.array(d.pose_t, dtype=np.float64) if d.pose_t is not None else None,
-            "err": float(d.pose_err) if d.pose_err is not None else None,
-            "det": d,
-            "corners": np.array(d.corners, dtype=np.float64),  # <--- ADD THIS
-        }
-    return out
 
-def match_by_id(left_map, right_map):
-    """Return dict: {tag_id: (left_info, right_info)} for ids seen in both."""
-    matched = {}
-    for tag_id, L in left_map.items():
-        if tag_id in right_map:
-            matched[tag_id] = (L, right_map[tag_id])
-    return matched
+def draw_detection(img_bgr, d, x_offset=0):
+    """Draw center + corners on a BGR image, with optional x offset (for right half)."""
+    cx, cy = float(d.center[0]), float(d.center[1])
+    cv2.circle(img_bgr, (int(cx) + x_offset, int(cy)), 4, (0, 0, 255), -1)
 
-def fmt_R(R):
-    return (
-        f"[{R[0,0]: .3f}, {R[0,1]: .3f}, {R[0,2]: .3f}]\n"
-        f"[{R[1,0]: .3f}, {R[1,1]: .3f}, {R[1,2]: .3f}]\n"
-        f"[{R[2,0]: .3f}, {R[2,1]: .3f}, {R[2,2]: .3f}]"
-    )
+    corners = np.array(d.corners, dtype=np.float32)
+    for (x, y) in corners:
+        cv2.circle(img_bgr, (int(x) + x_offset, int(y)), 3, (0, 255, 0), -1)
 
-def main_packed_stereo():
-    cap = cv2.VideoCapture(0)  # or your GStreamer pipeline
+
+def print_detection_pose(label, d):
+    tag_id = int(d.tag_id)
+    print(f"{label} Tag {tag_id}: decision_margin={d.decision_margin:.2f}, hamming={d.hamming}")
+
+    if d.pose_t is None or d.pose_R is None:
+        print("  pose: None")
+        return
+
+    t = np.array(d.pose_t, dtype=np.float64).reshape(-1)
+    err = float(d.pose_err) if d.pose_err is not None else None
+    print(f"  t = [{t[0]: .3f}, {t[1]: .3f}, {t[2]: .3f}] m  err={err}")
+
+def stereo_depth_from_centers(xL,yL,xR,yR,fx=(310.00),baseline_m=0.065):
+    disparity = xL - xR
+    if disparity <= 0:
+        return None
+    z = (fx*baseline_m)/disparity
+    return z
+def main():
+    cap = cv2.VideoCapture(0)
+    xL, yL,xR,yR = 0,0,0,0
 
     while True:
-        ok, frame = cap.read()
+        ok, frame_bgr = cap.read()
         if not ok:
             break
 
-        # Split packed stereo
-        gray_packed = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        left, right, mid = split_stereo_side_by_side(gray_packed)
+        gray_packed = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        left_gray, right_gray, mid = split_stereo_side_by_side(gray_packed)
 
-        # Detect + pose per camera half
-        left_info  = detect_with_pose(detector, left,  FX_L, FY_L, TAG_SIZE_M)
-        right_info = detect_with_pose(detector, right, FX_R, FY_R, TAG_SIZE_M)
+        # Pose from LEFT
+        dets_L, camL = detect_pose(left_gray, FX_L, FY_L, TAG_SIZE_M, CX_L, CY_L)
 
-        matched = match_by_id(left_info, right_info)
+        # Pose from RIGHT (separate function call)
+        dets_R, camR = detect_pose(right_gray, FX_R, FY_R, TAG_SIZE_M, CX_R, CY_R)
 
-        print(f"Left detections: {len(left_info)} | Right detections: {len(right_info)}")
-        print(f"Matched (both cameras): {len(matched)}")
+        print(f"\nLEFT dets: {len(dets_L)} cam={camL} | RIGHT dets: {len(dets_R)} cam={camR} | tag_size={TAG_SIZE_M}")
 
-        # Draw + print
-        for tag_id, (L, R) in matched.items():
-            (xL, yL) = L["center"]
-            (xR, yR) = R["center"]
-            corners_L = L["corners"]
-            corners_R = R["corners"]
+        # Draw + print left detections
+        for d in dets_L:
+            draw_detection(frame_bgr, d, x_offset=0)
+            print_detection_pose("LEFT", d)
+            xL =d.center[0]
+            yL = d.center[1]
 
-            # Draw on the ORIGINAL packed BGR frame
-            cv2.circle(frame, (int(xL), int(yL)), 4, (0, 0, 255), 1)              # left half
-            cv2.circle(frame, (int(xR) + mid, int(yR)), 4, (0, 0, 255), 1)        # right half shifted by mid
+        # Draw + print right detections (shift drawings by mid)
+        for d in dets_R:
+            draw_detection(frame_bgr, d, x_offset=mid)
+            print_detection_pose("RIGHT", d)
+            xR = d.center[0]
+            yR = d.center[1]
+        if all(v is not None for v in (xL, yL, xR, yR)):
+            print(stereo_depth_from_centers(xL, yL, xR, yR))
 
-            print(f"\nTag {tag_id}:")
-            print(f"  Centers: L=({xL:.2f},{yL:.2f})  R=({xR:.2f},{yR:.2f})")
+        cv2.imshow("packed stereo (pose L and R independently)", frame_bgr)
 
-            # Left pose
-            if L["R"] is not None and L["t"] is not None:
-                t = L["t"].reshape(-1)
-                print(f"  Left pose:")
-                print(f"    t = [{t[0]: .3f}, {t[1]: .3f}, {t[2]: .3f}]  meters")
-                #print(f"    R =\n{fmt_R(L['R'])}")
-                #print(f"    err = {L['err']:.4f}")
-            for (x, y) in corners_L:
-                cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1)
-
-            else:
-                print("  Left pose: (not available)")
-
-            # Right pose
-            if R["R"] is not None and R["t"] is not None:
-                t = R["t"].reshape(-1)
-                print(f"  Right pose:")
-                print(f"    t = [{t[0]: .3f}, {t[1]: .3f}, {t[2]: .3f}]  meters")
-                #print(f"    R =\n{fmt_R(R['R'])}")
-                #print(f"    err = {R['err']:.4f}")
-                for (x, y) in corners_R:
-                    cv2.circle(frame, (int(x+320), int(y)), 3, (0, 255, 0), -1)
-            else:
-                print("  Right pose: (not available)")
-
-        cv2.imshow("packed stereo (left|right)", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if (cv2.waitKey(1) & 0xFF) == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
-    main_packed_stereo()
+    main()

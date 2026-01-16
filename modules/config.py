@@ -34,6 +34,8 @@ TAG_SIZE_M = 0.166
 CONF       = 0.35
 STEREO_FOCAL_LENGTH = 700*(1/2.3) # pixels
 STEREO_BASELINE = 60 # mm
+YOLO_KPT_CONF = 0.6
+YOLO_VERBOSE = False
 # ----------------------------------------
 SELF_SEND_IP = "127.0.0.1"
 
@@ -50,3 +52,12 @@ LIDAR_WS_PORT = 8765
 LIDAR_MAX_RANGE = 12.0 # Meters
 LIDAR_DOWNSAMPLE = 0 # Not being used 
 LIDAR_AVOID_DISTANCES = {"close": 1.5, "middle": 2.5, "far": 3.5}
+
+# apriltag
+AT_FAMILIES = 'tagStandard41h12'
+AT_NTHREADS = 1
+AT_QUAD_DECIMATE = 1.0
+AT_QUAD_SIGMA = 0.8
+AT_REFINE_EDGES = 1
+AT_DECODE_SHARPENING = 0.25
+AT_DEBUG = 0

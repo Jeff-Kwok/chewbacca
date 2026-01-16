@@ -1,6 +1,6 @@
 def parse_payload(msg: str):
     parts = msg.strip().split(",")
-    if len(parts) != 14:
+    if len(parts) != 16:
         print(f"[WARN] Expected 14 fields, got {len(parts)}: {msg!r}")
         return None, None, None
 
@@ -16,11 +16,12 @@ def parse_payload(msg: str):
         b   = int(parts[7])
         x   = int(parts[8])
         y   = int(parts[9])
-
-        d_up    = int(parts[10])
-        d_down  = int(parts[11])
-        d_left  = int(parts[12])
-        d_right = int(parts[13])
+        LB = int(parts[10])
+        RB = int(parts[11])
+        d_up    = int(parts[12])
+        d_down  = int(parts[13])
+        d_left  = int(parts[14])
+        d_right = int(parts[15])
     except ValueError as e:
         print(f"[WARN] Failed to parse payload {msg!r}: {e}")
         return None, None, None
@@ -29,6 +30,7 @@ def parse_payload(msg: str):
     triggers = {"LT": lt, "RT": rt}
     buttons = {
         "A": a, "B": b, "X": x, "Y": y,
+        "LB": LB, "RB": RB,
         "DPAD_UP": d_up, "DPAD_DOWN": d_down,
         "DPAD_LEFT": d_left, "DPAD_RIGHT": d_right,
     }

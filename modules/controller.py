@@ -9,50 +9,28 @@ class ControllerModule:
     def __init__(self, sock, state):
         self.sock = sock
         self.state = state
-        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._last_dpad_up = 0
+        self.last_button3 = 0 
+        self.last_lb = 0
+        self.last_rb = 0
+        self.last_mode = 0
         self._last_dpad_down = 0
-        self.last_button3 = 0
-        self.last_button4 = 0
-
-    def state_flip(self):
-        self.state.mode = "camera" if self.state.mode == "controller" else "controller"
-        print(f"[STATE] Switched to: {self.state.mode}")
 
     def camera_mode_flip(self):
-        self.state.camera_mode = "tagging" if self.state.camera_mode == "hunting" else "hunting"
-        print(f"[CAMERA] Switched to: {self.state.camera_mode}")
-        try:
-            msg = json.dumps({"mode": self.state.camera_mode}).encode('utf-8')
-            self.send_sock.sendto(msg, (config.SELF_SEND_IP, config.CAMERA_CONTROL_PORT))
-        except Exception as e:
-            print(f"[CTRL] Failed to send camera mode: {e}")
+        self.state.camera_current = (self.state.camera_current + 1) % len(self.state.camera_modes)
+        new_mode = self.state.camera_modes[self.state.camera_current]
+        print(f"[CAMERA] Switched to: {new_mode}")
 
-    def select_frame(self, button1, button2, button3, button4):
-        # DPAD_LEFT increments
-        if button1 == 1:
-            self.state.select_state += 1
-            print("select_state:", self.state.select_state)
-
-        # DPAD_RIGHT decrements
-        if button2 == 1:
-            self.state.select_state -= 1
-            print("select_state:", self.state.select_state)
-
-        if self.state.select_state < 1:
-            self.state.select_state = 1
-
+    def select_frame(self, leftTrigger, rightTrigger, toggle):
+        # Mode shifting from ["Rest","Manual","Follower","Tag"]
+        if leftTrigger == 1:
+            self.state.robot_current -= 1
+            self.state.robot_current = max(0, self.state.robot_current)
+            print(self.state.robot_modes[self.state.robot_current])
+        if rightTrigger == 1:
+            self.state.robot_current += 1
+            self.state.robot_current = min(self.state.robot_current, 3)
+            print(self.state.robot_modes[self.state.robot_current])
         # X button toggles tracker
-        if button3 == 1 and self.last_button3 == 0:
-            self.state.tracker ^= 1
-            print(f"tracker: {self.state.tracker}")
-        self.last_button3 = button3
-        
-        # Y button toggles hunter
-        if button4 == 1 and self.last_button4 == 0:
-            self.state.hunter ^= 1
-            print(f"hunter: {self.state.hunter}")
-        self.last_button4 = button4
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -71,14 +49,38 @@ class ControllerModule:
             self.state.buttons = buttons
             self.state.last_joy_time = time.monotonic()
 
-            dpad_up = buttons["DPAD_UP"]
-            if dpad_up == 1 and self._last_dpad_up == 0:
-                self.state_flip()
-            self._last_dpad_up = dpad_up
-
             dpad_down = buttons["DPAD_DOWN"]
             if dpad_down == 1 and self._last_dpad_down == 0:
                 self.camera_mode_flip()
             self._last_dpad_down = dpad_down
 
-            self.select_frame(buttons["DPAD_LEFT"], buttons["DPAD_RIGHT"], buttons["X"], buttons["Y"])
+            # Robot Mode Cycler -> To go to new modes press RB and LB, toggle will always set to be off when transitioning to a new mode
+            lb = buttons["LB"]
+            rb = buttons["RB"]
+            lb_pressed = (lb == 1 and self.last_lb == 0)
+            rb_pressed = (rb == 1 and self.last_rb == 0)
+
+            if lb_pressed:
+                new_idx = self.state.robot_current - 1
+                if new_idx >= 0:
+                    self.state.robot_current = new_idx
+                    self.state.toggle = 0
+                    print(self.state.robot_modes[self.state.robot_current])
+
+            if rb_pressed:
+                new_idx = self.state.robot_current + 1
+                if new_idx < len(self.state.robot_modes):
+                    self.state.robot_current = new_idx
+                    self.state.toggle = 0
+                    print(self.state.robot_modes[self.state.robot_current])
+
+
+            self.last_lb = lb
+            self.last_rb = rb
+
+            toggle = buttons["A"]
+            if toggle == 1 and self.last_button3 == 0:
+                self.state.toggle ^= 1
+                print(f"Toggle: {self.state.toggle}")
+            self.last_button3 = toggle
+           # self.select_frame(buttons["LB"],buttons["RB"],buttons["A"])
