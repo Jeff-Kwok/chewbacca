@@ -1,316 +1,446 @@
 #!/usr/bin/env python3
 import os
+import sys
 import cv2
 import time
 import glob
 from ultralytics import YOLO
+from dt_apriltags import Detector
 import math
 import numpy as np
+import gc
+import torch
 
 # UDP SOCKET SENDING
 import json
-import asyncio
 import socket
 
-# ---------------- CONFIG ----------------
-IMAGE_RES = (640, 480)
+# Allow importing from parent directory if run as script
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Reconnect behavior
-OPEN_RETRY_SEC      = 1.0     # wait between open attempts
-REOPEN_BACKOFF_SEC  = 0.5     # small pause after releasing camera
-MAX_CONSEC_FAIL     = 10      # reopen after this many failed reads
-FIND_DEVICE_EVERY_N = 1       # re-scan devices each reconnect (1 = always)
+try:
+    from . import config
+    from .state import RobotState
+except ImportError:
+    import config
+    from state import RobotState
 
-# YOLO behavior
-MODEL_PATH = "models/yolo11l-pose.pt"
-print(MODEL_PATH)
-IMGSZ      = 512
-CONF       = 0.35
-# ----------------------------------------
-SEND_PORT = 5005
-SEND_IP = "127.0.0.1"
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-def build_vision_payload(cx, cy, cls, z, angle):
-    return {
+
+def build_vision_payload(cx, cy, cls, z, angle, corners=None):
+    payload = {
         "center": [float(cx), float(cy)],
         "id": f"object_{cls}",
         "z": float(z) if z is not None else 0.0,
         "angle": float(angle) if angle is not None else 0.0,
         "ts": time.time()
     }
+    # Optional: include tag corners if provided
+    if corners is not None:
+        payload["corners"] = [[float(x), float(y)] for (x, y) in corners]
+    return payload
 
 
-def find_camera_device(prefer_substr: str | None = None) -> str | None:
-    """
-    Returns a stable camera device path. Prefers /dev/v4l/by-id.
-    If prefer_substr is provided, it will pick the first matching path.
-    """
-    # Stable names first
-    by_id = sorted(glob.glob("/dev/v4l/by-id/*"))
-    if prefer_substr:
-        by_id = [p for p in by_id if prefer_substr in os.path.basename(p)]
-    if by_id:
-        return by_id[0]
+class CameraStereo:
+    def __init__(self):
+        self.state = RobotState()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # Fallback to by-path (also stable-ish)
-    by_path = sorted(glob.glob("/dev/v4l/by-path/*"))
-    if prefer_substr:
-        by_path = [p for p in by_path if prefer_substr in os.path.basename(p)]
-    if by_path:
-        return by_path[0]
+        # Control socket to receive mode switches
+        self.ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.ctrl_sock.bind(("0.0.0.0", config.CAMERA_CONTROL_PORT))
+        self.ctrl_sock.setblocking(False)
 
-    # Last resort: /dev/video*
-    videos = sorted(glob.glob("/dev/video*"))
-    return videos[0] if videos else None
+        # Reduce CPU thread thrash (important when mixing OpenCV + native libs)
+        cv2.setNumThreads(1)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-def open_camera(device: str, width: int, height: int) -> cv2.VideoCapture | None:
-    """
-    Opens a camera device path with V4L2 and applies basic settings.
-    """
-    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # reduce latency; not always honored
+        self.model = None
+        self.at_detector = None
+        self.at_detector_bad = False   # if we detect crashes, we can re-init once
 
-    if not cap.isOpened():
-        cap.release()
-        return None
+        self.cap = None
+        self.device = None
+        self.consec_fail = 0
 
-    return cap
+        # Create the detector ONCE (don’t create/destroy repeatedly)
+        self._init_apriltag_detector()
 
-def stereo_depth(cx_left,cx_right,fx,baseline):
-    d = cx_left - cx_right
-    if d<= 0:
-        return None
-    return(fx*baseline/d)
+    # ---------- CAMERA ----------
+    def find_camera_device(self, prefer_substr: str | None = None) -> str | None:
+        by_id = sorted(glob.glob("/dev/v4l/by-id/*"))
+        if prefer_substr:
+            by_id = [p for p in by_id if prefer_substr in os.path.basename(p)]
+        if by_id:
+            return by_id[0]
 
-def process_obb(r, tag=""):
-    obb = r.obb
-    out = []
+        by_path = sorted(glob.glob("/dev/v4l/by-path/*"))
+        if prefer_substr:
+            by_path = [p for p in by_path if prefer_substr in os.path.basename(p)]
+        if by_path:
+            return by_path[0]
 
-    if obb is None or len(obb) == 0:
-        return out
+        videos = sorted(glob.glob("/dev/video*"))
+        return videos[0] if videos else None
 
-    xywhr = obb.xywhr.cpu().numpy()           # (N, 5)
-    polys = obb.xyxyxyxy.cpu().numpy()        # (N, 8)
-    confs = obb.conf.cpu().numpy()            # (N,)
-    clss  = obb.cls.cpu().numpy().astype(int) # (N,)
+    def open_camera(self, device: str, width: int, height: int) -> cv2.VideoCapture | None:
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    for i in range(len(xywhr)):
-        cx, cy, w, h, ang = xywhr[i]
-        poly = polys[i].reshape(4, 2)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        return cap
 
-        out.append({
-            "cx": cx,
-            "cy": cy,
-            "w": w,
-            "h": h,
-            "ang": ang,
-            "poly": poly,
-            "conf": confs[i],
-            "cls": clss[i],
-        })
+    # ---------- STEREO ----------
+    def stereo_depth(self, cx_left, cx_right, fx, baseline):
+        d = cx_left - cx_right
+        if d <= 0:
+            return None
+        return (fx * baseline / d)
 
-        print(
-            f"[{tag}] cx={cx:.1f} cy={cy:.1f} "
-            f"w={w:.1f} h={h:.1f} ang={ang:.3f} "
-            f"conf={confs[i]:.2f} cls={clss[i]}"
+    # ---------- APRILTAG ----------
+    def _init_apriltag_detector(self):
+        """
+        Create one Detector instance and keep it for the life of the process.
+        This avoids native heap crashes from repeated init/free cycles.
+        """
+        try:
+            if self.at_detector is not None:
+                # do NOT del in a tight loop; but on init we can safely release
+                self.at_detector = None
+                gc.collect()
+                time.sleep(0.05)
+
+            # Use your family (you had tag16h5)
+            self.at_detector = Detector(
+                families='tag16h5',
+                nthreads=1,              # keep it 1 to avoid racey native alloc issues
+                quad_decimate=1.0,
+                quad_sigma=0.8,
+                refine_edges=1,
+                decode_sharpening=0.25,
+                debug=0
+            )
+            self.at_detector_bad = False
+            print("[CAM] AprilTag Detector initialized (persistent).")
+        except Exception as e:
+            print(f"[CAM] AprilTag Detector init failed: {e}")
+            self.at_detector = None
+            self.at_detector_bad = True
+
+    def detect_with_pose(self, detector, img_bgr_or_gray, fx, fy, tag_size_m):
+        """
+        Returns dict:
+          {tag_id: {"center":(cx,cy), "R":3x3, "t":3x1, "err":float, "corners":(4,2)}}
+        """
+
+        if detector is None:
+            return {}
+
+        # Ensure grayscale uint8 and contiguous memory (VERY important for native code stability)
+        if img_bgr_or_gray.ndim == 3:
+            gray = cv2.cvtColor(img_bgr_or_gray, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_bgr_or_gray
+
+        gray = np.ascontiguousarray(gray, dtype=np.uint8)
+
+        h, w = gray.shape[:2]
+        cx = w / 2.0
+        cy = h / 2.0
+        camera_params = (float(fx), float(fy), float(cx), float(cy))
+
+        # Run detection (native)
+        detections = detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=camera_params,
+            tag_size=float(tag_size_m)
         )
 
-    return out
-    
-def process_pose(r, tag=""):
-    out = []
-    if r.keypoints is None or len(r.keypoints) == 0:
+        out = {}
+        for d in detections:
+            tag_id = int(d.tag_id)
+
+            corners = np.array(d.corners, dtype=np.float32) if getattr(d, "corners", None) is not None else None
+
+            out[tag_id] = {
+                "center": (float(d.center[0]), float(d.center[1])),
+                "R": np.array(d.pose_R, dtype=np.float64) if getattr(d, "pose_R", None) is not None else None,
+                "t": np.array(d.pose_t, dtype=np.float64) if getattr(d, "pose_t", None) is not None else None,
+                "err": float(d.pose_err) if getattr(d, "pose_err", None) is not None else None,
+                "corners": corners,  # 4x2
+            }
         return out
 
-    kpts = r.keypoints.xy.cpu().numpy()      # (N, K, 2)
-    conf = None
-    if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None:
-        conf = r.keypoints.conf.cpu().numpy()  # (N, K)
-    clss = r.boxes.cls.cpu().numpy().astype(int) if r.boxes is not None else np.zeros(kpts.shape[0], dtype=int)
+    def match_by_id(self, left_map, right_map):
+        matched = {}
+        for tag_id, L in left_map.items():
+            if tag_id in right_map:
+                matched[tag_id] = (L, right_map[tag_id])
+        return matched
 
-    # YOLO pose keypoint indices (COCO): 5=L shoulder, 6=R shoulder, 11=L hip, 12=R hip
-    LSH, RSH, LHIP, RHIP = 5, 6, 11, 12
+    def draw_tag_debug(self, frame, info, color=(0, 255, 0)):
+        """
+        Draw center + polygon corners for apriltags.
+        """
+        for tag_id, d in info.items():
+            cx, cy = d["center"]
+            cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+            cv2.putText(frame, f"id:{tag_id}", (int(cx)+6, int(cy)+6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    for i in range(kpts.shape[0]):
-        pts = kpts[i]  # (K,2)
+            corners = d.get("corners", None)
+            if corners is not None and corners.shape == (4, 2):
+                pts = corners.astype(np.int32)
+                cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+                for i, (x, y) in enumerate(pts):
+                    cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 0), -1)
+                    cv2.putText(frame, str(i), (int(x)+4, int(y)-4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        # bbox from keypoints (more stable than r.boxes if you want)
-        xs = pts[:, 0]; ys = pts[:, 1]
-        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        w, h = (x2 - x1), (y2 - y1)
+    # ---------- YOLO POSE ----------
+    def process_pose(self, r, tag=""):
+        out = []
+        if r.keypoints is None or len(r.keypoints) == 0:
+            return out
 
-        def valid(idx):
-            if conf is None:  # no conf available, assume valid if finite
-                return np.isfinite(pts[idx]).all()
-            return conf[i, idx] > 0.3
+        kpts = r.keypoints.xy.cpu().numpy()
+        conf = None
+        if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None:
+            conf = r.keypoints.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int) if r.boxes is not None else np.zeros(kpts.shape[0], dtype=int)
 
-        # Orientation vector preference:
-        # 1) shoulder line: from left shoulder -> right shoulder
-        # 2) hip line
-        # 3) torso: mid-hip -> mid-shoulder
-        ang = None
+        LSH, RSH, LHIP, RHIP = 5, 6, 11, 12
 
-        if valid(LSH) and valid(RSH):
-            vx, vy = pts[RSH][0] - pts[LSH][0], pts[RSH][1] - pts[LSH][1]
-            ang = math.atan2(vy, vx)  # radians in image plane
-        elif valid(LHIP) and valid(RHIP):
-            vx, vy = pts[RHIP][0] - pts[LHIP][0], pts[RHIP][1] - pts[LHIP][1]
-            ang = math.atan2(vy, vx)
-        elif (valid(LSH) or valid(RSH)) and (valid(LHIP) or valid(RHIP)):
-            sh = (pts[LSH] + pts[RSH]) * 0.5 if (valid(LSH) and valid(RSH)) else (pts[LSH] if valid(LSH) else pts[RSH])
-            hp = (pts[LHIP] + pts[RHIP]) * 0.5 if (valid(LHIP) and valid(RHIP)) else (pts[LHIP] if valid(LHIP) else pts[RHIP])
-            vx, vy = sh[0] - hp[0], sh[1] - hp[1]
-            ang = math.atan2(vy, vx)
+        for i in range(kpts.shape[0]):
+            pts = kpts[i]
 
-        out.append({
-            "cx": cx, "cy": cy, "w": w, "h": h,
-            "ang": ang,           # orientation in image plane (radians) or None
-            "kpts": pts,          # all keypoints
-            "kp_conf": None if conf is None else conf[i],
-            "cls": int(clss[i]),
-        })
+            xs = pts[:, 0]; ys = pts[:, 1]
+            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+            cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            w, h = (x2 - x1), (y2 - y1)
 
-        print(f"[{tag}] cx={cx:.1f} cy={cy:.1f} w={w:.1f} h={h:.1f} ang={None if ang is None else f'{ang:.3f}'}")
+            def valid(idx):
+                if conf is None:
+                    return np.isfinite(pts[idx]).all()
+                return conf[i, idx] > 0.3
 
-    return out
+            ang = None
+            if valid(LSH) and valid(RSH):
+                vx, vy = pts[RSH][0] - pts[LSH][0], pts[RSH][1] - pts[LSH][1]
+                ang = math.atan2(vy, vx)
+            elif valid(LHIP) and valid(RHIP):
+                vx, vy = pts[RHIP][0] - pts[LHIP][0], pts[RHIP][1] - pts[LHIP][1]
+                ang = math.atan2(vy, vx)
+            elif (valid(LSH) or valid(RSH)) and (valid(LHIP) or valid(RHIP)):
+                sh = (pts[LSH] + pts[RSH]) * 0.5 if (valid(LSH) and valid(RSH)) else (pts[LSH] if valid(LSH) else pts[RSH])
+                hp = (pts[LHIP] + pts[RHIP]) * 0.5 if (valid(LHIP) and valid(RHIP)) else (pts[LHIP] if valid(LHIP) else pts[RHIP])
+                vx, vy = sh[0] - hp[0], sh[1] - hp[1]
+                ang = math.atan2(vy, vx)
 
-def draw_pose_debug(frame, objs, color=(0,255,0)):
-    for o in objs:
-        cx, cy = int(o["cx"]), int(o["cy"])
+            out.append({
+                "cx": cx, "cy": cy, "w": w, "h": h,
+                "ang": ang,
+                "kpts": pts,
+                "kp_conf": None if conf is None else conf[i],
+                "cls": int(clss[i]),
+            })
 
-        # draw center
-        cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
+            print(f"[{tag}] cx={cx:.1f} cy={cy:.1f} w={w:.1f} h={h:.1f} ang={None if ang is None else f'{ang:.3f}'}")
 
-        # draw orientation arrow if available
-        if o["ang"] is not None:
-            L = 50
-            x2 = int(cx + L * np.cos(o["ang"]))
-            y2 = int(cy + L * np.sin(o["ang"]))
-            cv2.arrowedLine(frame, (cx, cy), (x2, y2), color, 2)
+        return out
 
-        # draw keypoints
-        for (x, y) in o["kpts"]:
-            if np.isfinite(x) and np.isfinite(y):
-                cv2.circle(frame, (int(x), int(y)), 2, color, -1)
+    def draw_pose_debug(self, frame, objs, color=(0,255,0)):
+        for o in objs:
+            cx, cy = int(o["cx"]), int(o["cy"])
+            cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
 
-def main():
-    # (Optional) reduce CPU thread thrash
-    cv2.setNumThreads(1)
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
+            if o["ang"] is not None:
+                L = 50
+                x2 = int(cx + L * np.cos(o["ang"]))
+                y2 = int(cy + L * np.sin(o["ang"]))
+                cv2.arrowedLine(frame, (cx, cy), (x2, y2), color, 2)
 
-    model = YOLO(MODEL_PATH)
+            for (x, y) in o["kpts"]:
+                if np.isfinite(x) and np.isfinite(y):
+                    cv2.circle(frame, (int(x), int(y)), 2, color, -1)
 
-    cap = None
-    device = None
-    consec_fail = 0
+    # ---------- MODES ----------
+    def _run_hunting(self, left, right, f, B):
+        if self.model is None:
+            print("[CAM] Initializing YOLO model...")
+            self.model = YOLO(config.MODEL_PATH)
 
-    last_t = time.time()
-    fps = 0.0
-    f = 700*(1/2.3) # pixels
-    B = 60 # mm
-    d = 0 
-    print("Press 'q' or ESC to quit")
-    cLx, cLy, cxR,cyR = 0,0,0,0
-    cx = 0
-    cy = 0 
-    while True:
-        # Ensure camera is open
-        if cap is None:
-            device = find_camera_device()
-            if device is None:
-                print(f"[CAM] no camera device found. retrying in {OPEN_RETRY_SEC}s...")
-                time.sleep(OPEN_RETRY_SEC)
-                continue
-
-            cap = open_camera(device, IMAGE_RES[0], IMAGE_RES[1])
-            if cap is None:
-                print(f"[CAM] open failed for {device}. retrying in {OPEN_RETRY_SEC}s...")
-                time.sleep(OPEN_RETRY_SEC)
-                continue
-
-            print(f"[CAM] opened {device}")
-            consec_fail = 0
-
-        # Read frame
-        ret, frame = cap.read()
-
-        # Handle transient failures
-        if (not ret) or (frame is None):
-            consec_fail += 1
-            time.sleep(0.02)
-
-            if consec_fail >= MAX_CONSEC_FAIL:
-                print("[CAM] read failing repeatedly -> reopening camera")
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                cap = None
-                consec_fail = 0
-                time.sleep(REOPEN_BACKOFF_SEC)
-            continue
-
-        consec_fail = 0
-
-        # ----- YOLO inference -----
-        # Use source=frame to avoid "source missing" warnings
-# ----- YOLO inference -----
-        h_full, w_full = frame.shape[:2]
-        left  = frame[:, :w_full//2].copy()
-        right = frame[:, w_full//2:].copy()
-
-        results = model.predict(source=[left, right], imgsz=IMGSZ, conf=CONF, verbose=False)
+        results = self.model.predict(source=[left, right], imgsz=config.IMGSZ, conf=config.CONF, verbose=False)
         rL, rR = results[0], results[1]
 
-        objsL = process_pose(rL, "L")
-        objsR = process_pose(rR, "R")
-        draw_pose_debug(left,  objsL, (0,255,0))
-        draw_pose_debug(right, objsR, (255,0,0))
+        objsL = self.process_pose(rL, "L")
+        objsR = self.process_pose(rR, "R")
+        self.draw_pose_debug(left,  objsL, (0,255,0))
+        self.draw_pose_debug(right, objsR, (255,0,0))
+
         if objsL and objsR:
-            try: 
-                z=float(stereo_depth(objsL[0]["cx"],objsR[0]["cx"],f,B))
-                angle = np.arctan((320/2-objsL[0]["cx"])/f*3)
+            try:
+                z = float(self.stereo_depth(objsL[0]["cx"], objsR[0]["cx"], f, B))
+                angle = np.arctan((320/2 - objsL[0]["cx"]) / f * 3)
                 payload = build_vision_payload(objsL[0]["cx"], objsL[0]["cy"], objsL[0]["cls"], z, angle)
                 packet = json.dumps(payload).encode('utf-8')
                 if packet:
-                    sock.sendto(packet,(SEND_IP,SEND_PORT))
+                    self.sock.sendto(packet, (config.SELF_SEND_IP, config.CAMERA_PORT))
                     print(payload)
             except Exception as e:
                 print(e)
-        else:
-            None
-        # ----- FPS -----
-        now = time.time()
-        dt = now - last_t
-        last_t = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt)
 
-        cv2.putText(
-            left,
-            f"FPS: {fps:.1f}",
-            (10, left.shape[0] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
+    def _run_tagging(self, left, right, f, B):
+        # Do NOT destroy/recreate detector in loop. Keep persistent.
 
-        vis = np.hstack([left, right])
-        cv2.imshow("YOLO Pose Stereo", vis)
+        try:
+            left_info  = self.detect_with_pose(self.at_detector, left,  f, f, config.TAG_SIZE_M)
+            right_info = self.detect_with_pose(self.at_detector, right, f, f, config.TAG_SIZE_M)
+        except Exception as e:
+            # If native code throws, rebuild detector ONCE (not per-frame)
+            print(f"[CAM] AprilTag detect exception: {e}")
+            if not self.at_detector_bad:
+                print("[CAM] Reinitializing AprilTag detector once due to error...")
+                self.at_detector_bad = True
+                self._init_apriltag_detector()
+            return
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or key == 27:
-            break
+        matched = self.match_by_id(left_info, right_info)
 
-    if cap is not None:
-        cap.release()
-    cv2.destroyAllWindows()
+        # Draw debug
+        self.draw_tag_debug(left, left_info, color=(0, 255, 0))
+        self.draw_tag_debug(right, right_info, color=(0, 255, 0))
+
+        # Send one matched tag
+        for tag_id, (L, R) in matched.items():
+            cxL, cyL = L["center"]
+
+            if L["t"] is not None:
+                t = L["t"].reshape(-1)
+                z_m = float(t[2])
+                z_mm = z_m * 1000.0
+
+                angle = math.atan2(-float(t[0]), float(t[2]))
+
+                # include corners in payload (from left tag)
+                corners = None
+                if L.get("corners", None) is not None and L["corners"].shape == (4, 2):
+                    corners = L["corners"]
+
+                payload = build_vision_payload(cxL, cyL, tag_id, z_mm, angle, corners=corners)
+                packet = json.dumps(payload).encode('utf-8')
+                if packet:
+                    self.sock.sendto(packet, (config.SELF_SEND_IP, config.CAMERA_PORT))
+                    print(f"[TAG] ID={tag_id} z={z_mm:.1f}mm ang={angle:.3f} corners={corners.tolist() if corners is not None else None}")
+                break
+
+        cv2.putText(left, "MODE: TAGGING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # ---------- MAIN LOOP ----------
+    def run(self):
+        last_t = time.time()
+        fps = 0.0
+        f = config.STEREO_FOCAL_LENGTH
+        B = config.STEREO_BASELINE
+
+        print("Press 'q' or ESC to quit")
+
+        while True:
+            # Check for mode updates from controller
+            try:
+                data, _ = self.ctrl_sock.recvfrom(1024)
+                msg = json.loads(data.decode('utf-8'))
+                if "mode" in msg:
+                    self.state.camera_mode = msg["mode"]
+                    print(f"[CAM] Mode switched to: {self.state.camera_mode}")
+            except BlockingIOError:
+                pass
+            except Exception:
+                pass
+
+            # Ensure camera is open
+            if self.cap is None:
+                self.device = self.find_camera_device()
+                if self.device is None:
+                    print(f"[CAM] no camera device found. retrying in {config.OPEN_RETRY_SEC}s...")
+                    time.sleep(config.OPEN_RETRY_SEC)
+                    continue
+
+                self.cap = self.open_camera(self.device, config.IMAGE_RES[0], config.IMAGE_RES[1])
+                if self.cap is None:
+                    print(f"[CAM] open failed for {self.device}. retrying in {config.OPEN_RETRY_SEC}s...")
+                    time.sleep(config.OPEN_RETRY_SEC)
+                    continue
+
+                print(f"[CAM] opened {self.device}")
+                self.consec_fail = 0
+
+            ret, frame = self.cap.read()
+
+            if (not ret) or (frame is None):
+                self.consec_fail += 1
+                time.sleep(0.02)
+
+                if self.consec_fail >= config.MAX_CONSEC_FAIL:
+                    print("[CAM] read failing repeatedly -> reopening camera")
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                    self.consec_fail = 0
+                    time.sleep(config.REOPEN_BACKOFF_SEC)
+                continue
+
+            self.consec_fail = 0
+
+            h_full, w_full = frame.shape[:2]
+            left  = frame[:, :w_full//2].copy()
+            right = frame[:, w_full//2:].copy()
+
+            if self.state.camera_mode == "hunting":
+                self._run_hunting(left, right, f, B)
+            elif self.state.camera_mode == "tagging":
+                # If you REALLY must free YOLO GPU memory, do it only once when mode switches,
+                # but frequent create/destroy also causes instability. Keeping it is safer.
+                self._run_tagging(left, right, f, B)
+
+            # FPS
+            now = time.time()
+            dt = now - last_t
+            last_t = now
+            if dt > 0:
+                fps = 0.9 * fps + 0.1 * (1.0 / dt)
+
+            cv2.putText(
+                left,
+                f"FPS: {fps:.1f}",
+                (10, left.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+            vis = np.hstack([left, right])
+            cv2.imshow("YOLO Pose Stereo", vis)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q") or key == 27:
+                break
+
+        if self.cap is not None:
+            self.cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    cs = CameraStereo()
+    cs.run()

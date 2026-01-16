@@ -215,7 +215,7 @@ class MotorFunctions:
     def calc_robot_yaw(self,desired,reading):
         w_rate = 0
         value = ((desired - reading) + 2*np.pi) % (2*np.pi)
-        if abs(value) >= np.deg2rad(12.5):
+        if abs(value) >= np.deg2rad(6.5):
             if value < np.pi:
                 w_rate = (value/np.pi)*.5
             elif value > np.pi:

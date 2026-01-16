@@ -1,18 +1,32 @@
 import asyncio
 import time
+import socket
+import json
+from . import config
 from .utils import parse_payload
 
 class ControllerModule:
     def __init__(self, sock, state):
         self.sock = sock
         self.state = state
+        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._last_dpad_up = 0
+        self._last_dpad_down = 0
         self.last_button3 = 0
         self.last_button4 = 0
 
     def state_flip(self):
         self.state.mode = "camera" if self.state.mode == "controller" else "controller"
         print(f"[STATE] Switched to: {self.state.mode}")
+
+    def camera_mode_flip(self):
+        self.state.camera_mode = "tagging" if self.state.camera_mode == "hunting" else "hunting"
+        print(f"[CAMERA] Switched to: {self.state.camera_mode}")
+        try:
+            msg = json.dumps({"mode": self.state.camera_mode}).encode('utf-8')
+            self.send_sock.sendto(msg, (config.SELF_SEND_IP, config.CAMERA_CONTROL_PORT))
+        except Exception as e:
+            print(f"[CTRL] Failed to send camera mode: {e}")
 
     def select_frame(self, button1, button2, button3, button4):
         # DPAD_LEFT increments
@@ -61,5 +75,10 @@ class ControllerModule:
             if dpad_up == 1 and self._last_dpad_up == 0:
                 self.state_flip()
             self._last_dpad_up = dpad_up
+
+            dpad_down = buttons["DPAD_DOWN"]
+            if dpad_down == 1 and self._last_dpad_down == 0:
+                self.camera_mode_flip()
+            self._last_dpad_down = dpad_down
 
             self.select_frame(buttons["DPAD_LEFT"], buttons["DPAD_RIGHT"], buttons["X"], buttons["Y"])

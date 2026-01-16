@@ -20,6 +20,7 @@ class RobotState:
         
         # High Level State
         self.mode = "controller" # "controller" or "camera"
+        self.camera_mode = "hunting" # "hunting" or "tagging"
         self.select_state = 1
         self.tracker = 0
         self.hunter = 0
