@@ -22,7 +22,7 @@ async def camera_loop(state: RobotState):
     Main loop for camera processing. Runs in a separate thread to avoid blocking asyncio.
     """
     print("[CAM] Starting camera loop...")
-    cam = CameraStereo()
+    cam = CameraStereo(RobotState())
     
     loop = asyncio.get_running_loop()
 
@@ -38,17 +38,31 @@ async def camera_loop(state: RobotState):
         )
 
         if payload:
-            z = payload.get("z")
-            angle = payload.get("angle")
-            if z is not None and angle is not None:
-                state.hunted["distance"] = z
-                state.hunted["angle"] = angle
-            else:
-                state.hunted["distance"] = 0.0
-                state.hunted["angle"] = 0.0
+            if mode == "Yolo":
+                z = payload.get("z")
+                angle = payload.get("angle")
+                if z is not None and angle is not None:
+                    state.hunted["distance"] = z
+                    state.hunted["angle"] = angle
+                else:
+                    state.hunted["distance"] = 0.0
+                    state.hunted["angle"] = 0.0
+            elif mode == "AprilTag":
+                tag_id = payload.get("id")
+                x = payload.get("z")
+                angle = payload.get("angle")
+                if tag_id is not None:
+                    state.tag_sequence = {
+                        "id": tag_id,
+                        "x": x,
+                        "angle": angle,
+                    }
+                else:
+                    state.tag_sequence = None
         else:
             state.hunted["distance"] = 0.0
             state.hunted["angle"] = 0.0
+            state.tag_sequence = None
 
         if vis_frame is not None:
             cv2.imshow("Camera", vis_frame)

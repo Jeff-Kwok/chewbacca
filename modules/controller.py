@@ -15,10 +15,6 @@ class ControllerModule:
         self.last_mode = 0
         self._last_dpad_down = 0
 
-    def camera_mode_flip(self):
-        self.state.camera_current = (self.state.camera_current + 1) % len(self.state.camera_modes)
-        new_mode = self.state.camera_modes[self.state.camera_current]
-        print(f"[CAMERA] Switched to: {new_mode}")
 
     def select_frame(self, leftTrigger, rightTrigger, toggle):
         # Mode shifting from ["Rest","Manual","Follower","Tag"]
@@ -49,10 +45,6 @@ class ControllerModule:
             self.state.buttons = buttons
             self.state.last_joy_time = time.monotonic()
 
-            dpad_down = buttons["DPAD_DOWN"]
-            if dpad_down == 1 and self._last_dpad_down == 0:
-                self.camera_mode_flip()
-            self._last_dpad_down = dpad_down
 
             # Robot Mode Cycler -> To go to new modes press RB and LB, toggle will always set to be off when transitioning to a new mode
             lb = buttons["LB"]

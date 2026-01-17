@@ -1,3 +1,4 @@
+# Parsing payload 
 def parse_payload(msg: str):
     parts = msg.strip().split(",")
     if len(parts) != 16:

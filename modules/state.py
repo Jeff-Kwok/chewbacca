@@ -29,11 +29,13 @@ class RobotState:
         self.hunted = {"angle": 0.0, "distance": 0.0}
         
         # April Tag Behavior List
-        self.behavior_modes = ["Rest","Docking","Lost","Hunting","Centering"]
-        self.behavior_current = 0
+        self.tag_behavior_modes = ["Rest","Docking","Lost","Hunting","Centering"]
+        self.tag_behavior_current = 0
+        self.tag_behavior_toggle = 0
         self.tag_sequence = []
-        self.tag_discovery = []
-        self.tag_current = 0
+        self.tag_discovered = {}
+        self.tag_explore_sequence = []
+        self.tag_current = None
 
 
         # Lidar Zone

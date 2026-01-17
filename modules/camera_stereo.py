@@ -11,9 +11,6 @@ import numpy as np
 import gc
 import torch
 
-# Allow importing from parent directory if run as script
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 try:
     from . import config
     from .state import RobotState
@@ -37,7 +34,7 @@ def build_vision_payload(cx, cy, cls, z, angle, corners=None):
 
 
 class CameraStereo:
-    def __init__(self):
+    def __init__(self, state):
         # Reduce CPU thread thrash (important when mixing OpenCV + native libs)
         cv2.setNumThreads(1)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -56,6 +53,7 @@ class CameraStereo:
         self.fps = 0.0
         self.f = config.STEREO_FOCAL_LENGTH
         self.B = config.STEREO_BASELINE
+        self.state = state
 
         # Create the detector ONCE (don’t create/destroy repeatedly)
         self._init_apriltag_detector()
@@ -113,18 +111,18 @@ class CameraStereo:
                 gc.collect()
                 time.sleep(0.05)
 
-            # Use your family (you had tag16h5)
+            # Parameters from AprilTagPoseEstimation.py for identical detection scheme
             self.at_detector = Detector(
-                families=getattr(config, 'AT_FAMILIES', 'tag16h5'),
-                nthreads=getattr(config, 'AT_NTHREADS', 1),              # keep it 1 to avoid racey native alloc issues
-                quad_decimate=getattr(config, 'AT_QUAD_DECIMATE', 1.0),
-                quad_sigma=getattr(config, 'AT_QUAD_SIGMA', 0.8),
-                refine_edges=getattr(config, 'AT_REFINE_EDGES', 1),
-                decode_sharpening=getattr(config, 'AT_DECODE_SHARPENING', 0.25),
-                debug=getattr(config, 'AT_DEBUG', 0)
+                families='tagStandard41h12',
+                nthreads=4,
+                quad_decimate=1.0,
+                quad_sigma=0.0,
+                refine_edges=1,
+                decode_sharpening=0.25,
+                debug=0
             )
             self.at_detector_bad = False
-            print("[CAM] AprilTag Detector initialized (persistent).")
+            print("[CAM] AprilTag Detector initialized (persistent, AprilTagPoseEstimation scheme).")
         except Exception as e:
             print(f"[CAM] AprilTag Detector init failed: {e}")
             self.at_detector = None
@@ -243,17 +241,29 @@ class CameraStereo:
                 self.at_detector_bad = True
                 self._init_apriltag_detector()
             return None
+
         
         matched = self.match_by_id(left_info, right_info)
         self.draw_tag_debug(left, left_info), self.draw_tag_debug(right, right_info)
         
         for tag_id, (L, R) in matched.items():
-            if L["t"] is not None:
-                t = L["t"].reshape(-1)
-                z_mm = float(t[2]) * 1000.0
-                angle = math.atan2(-float(t[0]), float(t[2]))
+            # Has all information of the seen id use matched
+            cx_left = L["center"][0]
+            cx_right = R["center"][0]
+            # Calculate depth from stereo disparity
+            z_m = self.stereo_depth(cx_left, cx_right, self.f, self.B)
+
+            if z_m is not None:
+                z_mm = z_m * 1000.0  # Convert to mm
+                
+                # We can still get angle from the monocular pose of the left camera
+                angle = None
+                if L["t"] is not None:
+                    t = L["t"].reshape(-1)
+                    angle = math.atan2(-float(t[0]), float(t[2]))
+
                 corners = L.get("corners")
-                return build_vision_payload(L["center"][0], L["center"][1], tag_id, z_mm, angle, corners)
+                return build_vision_payload(L["center"][0], L["center"][1], tag_id,t[2], angle, corners)
         return None
 
     def _run_idle(self, left, right):
