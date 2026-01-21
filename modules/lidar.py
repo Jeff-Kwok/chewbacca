@@ -26,13 +26,14 @@ class LidarModule:
         finally:
             self.clients.discard(websocket)
 
-    async def broadcast_scan(self, angles_rad, ranges_m):
+    async def broadcast_scan(self, angles_rad, ranges_m, intensity):
         if not self.clients:
             return
         payload = {
             "type": "scan",
             "angles": angles_rad,
             "ranges": ranges_m,
+            "intensity": intensity,
             "range_max": config.LIDAR_MAX_RANGE,
         }
         msg = json.dumps(payload)
@@ -73,77 +74,82 @@ class LidarModule:
         return -x_sum / w_sum, -y_sum / w_sum
 
     def lidar_loop(self):
-        print(f"[LIDAR] Connecting to {config.LIDAR_SERIAL_PORT}...")
-        try:
-            lidar = RPLidar(config.LIDAR_SERIAL_PORT)
-            self.lidar_obj = lidar
-            lidar.stop_motor()
-            time.sleep(1)
-            lidar.start_motor()
-            print("[LIDAR] Connected. Scanning...")
+        while not self.stop_event.is_set():
+            try:
+                print(f"[LIDAR] Connecting to {config.LIDAR_SERIAL_PORT}...")
+                lidar = RPLidar(config.LIDAR_SERIAL_PORT)
+                self.lidar_obj = lidar
+                lidar.start_motor()
+                print("[LIDAR] Connected. Scanning...")
 
-            for scan in lidar.iter_scans():
-                if self.stop_event.is_set():
-                    break
-                if not scan:
-                    continue
-
-                angles_deg = [m[1] for m in scan]
-                dists_mm = [m[2] for m in scan]
-                angles_rad = []
-                ranges_m = []
-                check_angles_rad = []
-                check_ranges_m = []
-                min_rm = None
-
-                for i, (a_deg, d_mm) in enumerate(zip(angles_deg, dists_mm)):
-                    #if i % config.LIDAR_DOWNSAMPLE != 0:
-                    #    continue
-                    r_m = d_mm / 1000.0
-                    if r_m <= 0.0 or r_m > config.LIDAR_MAX_RANGE:
+                for scan in lidar.iter_scans():
+                    if self.stop_event.is_set():
+                        break
+                    if not scan:
                         continue
                     
-                    angles_rad.append(math.radians(a_deg))
-                    ranges_m.append(r_m)
-                    # If distances less than or equal to close get's apppended to check_angles_rad and check_angles_m
-                    if r_m <= config.LIDAR_AVOID_DISTANCES["close"]:
-                        check_angles_rad.append(math.radians(a_deg))
-                        check_ranges_m.append(r_m)
+                    intensity = [m[0] for m in scan]
+                    angles_deg = [m[1] for m in scan]
+                    dists_mm = [m[2] for m in scan]
+                    angles_rad = []
+                    ranges_m = []
+                    check_angles_rad = []
+                    check_ranges_m = []
 
-                    # If distance less than far is detected -> minimum r_m, ignore for now
-                    #if r_m <= config.LIDAR_AVOID_DISTANCES["far"]:
-                    #    if (min_rm is None) or (r_m < min_rm):
-                    #        min_rm = r_m
+                    for a_deg, d_mm in zip(angles_deg, dists_mm):
+                        r_m = d_mm / 1000.0
+                        if r_m <= 0.0 or r_m > config.LIDAR_MAX_RANGE:
+                            continue
+                        
+                        angles_rad.append(math.radians(a_deg))
+                        ranges_m.append(r_m)
+                        if r_m <= config.LIDAR_AVOID_DISTANCES["close"]:
+                            check_angles_rad.append(math.radians(a_deg))
+                            check_ranges_m.append(r_m)
 
-                x_sum, y_sum = self.avoid_obstacles(check_angles_rad, check_ranges_m)
-                #zone_now = self.speed_check(min_rm)
-                
-                self.state.lidar_close = {
-                    "angles": check_angles_rad,
-                    "ranges": check_ranges_m
-                }
+                    x_sum, y_sum = self.avoid_obstacles(check_angles_rad, check_ranges_m)
+                    
+                    self.state.lidar_close = {
+                        "angles": check_angles_rad,
+                        "ranges": check_ranges_m
+                    }
 
-                # Update State directly
-                #self.state.zone["zone"] = zone_now
-                #self.state.zone["x_sum"] = x_sum
-                #self.state.zone["y_sum"] = y_sum
+                    if ranges_m and self.loop:
+                        # Websocket broadcast
+                        asyncio.run_coroutine_threadsafe(
+                            self.broadcast_scan(angles_rad, ranges_m, intensity),
+                            self.loop
+                        )
+                        # Update state with the lidar payload for the broadcaster
+                        self.state.lidar_payload = {
+                            "type": "scan",
+                            "angles": angles_rad,
+                            "ranges": ranges_m,
+                            "intensity": intensity,
+                            "range_max": config.LIDAR_MAX_RANGE,
+                        }
 
-                if ranges_m and self.loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self.broadcast_scan(angles_rad, ranges_m),
-                        self.loop
-                    )
-        except Exception as e:
-            print(f"[LIDAR] Error: {e}")
-        finally:
-            print("[LIDAR] Stopping hardware...")
-            try:
+            except Exception as e:
+                print(f"[LIDAR] Error: {e}. Retrying in 5 seconds...")
                 if self.lidar_obj:
-                    self.lidar_obj.stop()
-                    self.lidar_obj.stop_motor()
-                    self.lidar_obj.disconnect()
-            except Exception:
-                pass
+                    try:
+                        self.lidar_obj.stop()
+                        self.lidar_obj.stop_motor()
+                        self.lidar_obj.disconnect()
+                    except Exception as disconnect_e:
+                        print(f"[LIDAR] Error during disconnect: {disconnect_e}")
+                self.lidar_obj = None
+                time.sleep(5)
+        
+        # Cleanup when stop_event is set
+        print("[LIDAR] Stopping hardware...")
+        if self.lidar_obj:
+            try:
+                self.lidar_obj.stop()
+                self.lidar_obj.stop_motor()
+                self.lidar_obj.disconnect()
+            except Exception as e:
+                print(f"[LIDAR] Error during final stop: {e}")
 
     async def run(self):
         self.loop = asyncio.get_running_loop()

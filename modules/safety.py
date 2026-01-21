@@ -25,6 +25,7 @@ class SafetyModule:
             lidar_data = self.state.lidar_close
             close_angles = ((lidar_data.get("angles", [])) + np.deg2rad(90)) % (2*np.pi)# Orientation and wrap from 0 to 2pi
             close_ranges = lidar_data.get("ranges", [])
+            #print(close_angles)
 
             # Receive Controller axes
             lx = self.state.axes["LX"] * -1 # Orientation
@@ -44,7 +45,7 @@ class SafetyModule:
             count = int(np.sum(mask))
 
             if count > 0:
-                scale = 1.0/count
+                scale = 2.0/count
                 rep_x = np.sum(np.cos(close_angles[mask])) * scale
                 rep_y = np.sum(np.sin(close_angles[mask])) * scale
                 angles_x -= rep_x
@@ -71,25 +72,5 @@ class SafetyModule:
                 f"rep x:{rep_x:.2f} | rep y:{rep_y:.2f} |\n"
                 f"resultant output: LX: {self.resultant_x:.2f} LY: {self.resultant_y:.2f}"
                 )
-                '''
+            '''
             await asyncio.sleep(0.05) # Run at ~20Hz
-
-
-'''
-            # For each value in the angles detected within close range we want to check that value lies within our controller arc
-            count = sum (controller_arc[0] <= val <= controller_arc[1] for val in close_angles)
-            for i,val in enumerate(close_angles):
-                if controller_arc[0] <= val <= controller_arc[1]:
-                    # If our intention vector is within an area of the vector histogram, we use the distance to determine
-                    if close_ranges[i] < 0.5:
-                        print(angles_y)
-                        angles_x -= 1*np.cos(val) * 10/count
-                        angles_y -= 1*np.sin(val) * 10/count
-                else:
-                    continue
-            #print(angles_x)
-            #print(angles_y)
-            #resultant_angle =round(np.arctan2(controller_y,controller_x),3)
-            #if resultant_angle < 0:
-            #    resultant_angle = resultant_angle + 2*math.pi
-            #print(np.rad2deg(resultant_angle))'''

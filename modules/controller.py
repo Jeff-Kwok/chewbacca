@@ -14,6 +14,7 @@ class ControllerModule:
         self.last_rb = 0
         self.last_mode = 0
         self._last_dpad_down = 0
+        self.last_button4 = 0
 
 
     def select_frame(self, leftTrigger, rightTrigger, toggle):
@@ -75,4 +76,13 @@ class ControllerModule:
                 self.state.toggle ^= 1
                 print(f"Toggle: {self.state.toggle}")
             self.last_button3 = toggle
-           # self.select_frame(buttons["LB"],buttons["RB"],buttons["A"])
+
+
+            if self.state.robot_modes[self.state.robot_current] == "Tag" and self.state.toggle ==1:
+                autonomy_toggle = buttons["B"]
+                if autonomy_toggle == 1 and self.last_button4 == 0:
+                    self.state.tag_behavior_toggle ^= 1
+                    print(f"Autonomy Toggle: {self.state.tag_behavior_toggle}")
+                self.last_button4 = autonomy_toggle
+            else:
+                 pass

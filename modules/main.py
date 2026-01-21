@@ -16,6 +16,7 @@ from .stm32 import STMModule
 from .lidar import LidarModule
 from .core_control import ControlLoop
 from .safety import SafetyModule
+from .udp_broadcaster import UdpBroadcaster
 
 async def camera_loop(state: RobotState):
     """
@@ -93,10 +94,11 @@ async def main():
 
     # Initialize modules
     ctrl_mod = ControllerModule(sock_ctrl, state)
-    stm_mod = STMModule(config.STM_SERIAL_PORT, config.STM_BAUD, state, sock_desktop, config.SEND_PORT, config.SEND_IP)
+    stm_mod = STMModule(config.STM_SERIAL_PORT, config.STM_BAUD, state,motors)
     lidar_mod = LidarModule(state)
     core_mod = ControlLoop(state, motors)
     safety_mod = SafetyModule(state)
+    broadcaster_mod = UdpBroadcaster(state,motors)
     
     print("Starting all modules...")
     try:
@@ -104,9 +106,10 @@ async def main():
             ctrl_mod.run(),
             camera_loop(state),
             core_mod.run(),
-            #stm_mod.run(),
-            #lidar_mod.run(),
-            #safety_mod.run()
+            stm_mod.run(),
+            lidar_mod.run(),
+            safety_mod.run(),
+            broadcaster_mod.run(),
         )
     finally:
         # Cleanup

@@ -10,6 +10,7 @@
 
 # behavior.py
 import numpy as np
+import time
 class BehaviorBase:
     """Common interface."""
     name = "Base"
@@ -39,8 +40,8 @@ class Manual(BehaviorBase):
         ctrl.motors.brake_all_motors(message_toggle=False)
     def hunt(self, ctrl, dt):
         # drive based on joystick
-        x  = ctrl.state.axes["LX"] * -1
-        y  = ctrl.state.axes["LY"]
+        x  = ctrl.state.safe_axes["LX"]
+        y  = ctrl.state.safe_axes["LY"]
         rx = ctrl.state.axes["RX"] * -1
         ry = ctrl.state.axes["RY"]
         yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
@@ -53,7 +54,7 @@ class Manual(BehaviorBase):
             w = 0 
             #print(f"stick{angle:.2f}")
         w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, w)
-        print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
+        #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
             })
@@ -68,6 +69,8 @@ class Follower(BehaviorBase):
 
     def on_enter(self,ctrl):
         ctrl.state.camera_current = 1
+        ctrl.state.tag_behavior_toggle = 0
+        ctrl.state.tag_behavior_current = 0
         print(ctrl.state.camera_modes[ctrl.state.camera_current])
 
     def hunt(self, ctrl, dt):
@@ -102,6 +105,11 @@ class Tag(BehaviorBase):
     # Make sure we don't reset our explored tags if we leave this mode
     def __init__(self):
         self.last_seen_tag = None
+        self.last_autonomy_toggle = 0
+        self.performance_point = 0
+        self.sequence_check_condition = False
+        self.docking_check_condition = False
+    
     def stop(self, ctrl, dt):
         ctrl.state.camera_current = 0
         ctrl.motors.brake_all_motors(message_toggle=False)
@@ -109,71 +117,183 @@ class Tag(BehaviorBase):
     def on_enter(self,ctrl):
         ctrl.state.camera_current = 2
         print(ctrl.state.camera_modes[ctrl.state.camera_current])
-    
-    def docking(self,ctrl,dt):
+    ## On leave
+    def enter_autonomy(self, ctrl):
+        print("[AUTO] Entering tag autonomy")
+        ctrl.motors.brake_all_motors(message_toggle=False)
+        self.performance_point = 0
+        # Start from Rest
+        ctrl.state.tag_behavior_current = ctrl.state.tag_behavior_modes.index("Rest")
+
+    def docking(self,ctrl,dt,sequence):
         # Where are we right now
-        if ctrl.state.tag_discovered is not None:
-            home = ctrl.state.tag_discovered[0]
-        
+        # Sequence CHECKS  
+        try: 
+            print(dt)
+            print(sequence)
+            print(
+                    f"Our home is: {sequence[0]}"
+                    f"Now moving towards: {sequence[0]}"
+                )
+            self.performance_point = 1
+            # while True:
+                # If robot position not == home:
+                    # KEEP MOVING
+                # elif ROBOT POSITIOn == HOME:
+                    #self.performance_point = 1
+                    #self.docking_condition = True
+                    #break
+        except Exception as e:
+            self.performance_point = 0
+            print(e)        
+        #if ctrl.state.tag_discovered is not None:
+        #   home = ctrl.state.tag_discovered[0]
         # Move towards home such that robot position should == home[x,y]
         # Calculate vector from (robot[x,y],home[x,y])
         # Movement function should be if robot[x] != home[x], mv wheel_[x_vec,y_vec]
-        pass
+        return self.performance_point
 
+    # DEFINE MOVEMENT FUNCTION -> PULLS FROM MOTOR
     def Lost(self):
         # If robot at supposed tag_id[x,y] and tag_id not found, spin in circle to locate tag
         # If spin no success, go back to previous point and idle.
         pass
     
+    def sequence_check(self,ctrl,sequence):
+        if len(sequence) >= 3:
+            print(
+                f"Adequate number of tags held: {ctrl.state.tag_explore_sequence}",
+                "Starting autonomy sequence:",
+                #f"Docking at: {ctrl.state.tag_explore_sequence[0]}"
+            )
+            ctrl.state.tag_behavior_current = 1
+            self.sequence_check_condition = True
+            self.performance_point = 1
+        elif len(sequence) < 3:
+            print(f"Inadequate number of tags held: {ctrl.state.tag_explore_sequence}, need at least 3")
+            self.performance_point = 0
+            self.sequence_check_condition = False
+            return self.performance_point
+
+    # Completely stops all behavior
+    def behavior_roll(self,ctrl):
+        ctrl.motors.brake_all_motors(message_toggle=False)
+        ctrl.state.tag_behavior_current = 0
+        ctrl.state.tag_behavior_toggle = 0
+        print(
+        "Going back to manual tagging mode",
+        f"Behavior Mode set to: {ctrl.state.tag_behavior_modes[ctrl.state.tag_behavior_current]}",
+        f"Autonomy Toggle: {ctrl.state.tag_behavior_toggle}"
+        )
+
     def hunt(self, ctrl, dt):
         # tag hunt logic here
         now = time.monotonic()
         seq = ctrl.state.tag_sequence
         #print(seq)
-        if seq is None:
-            self.last_seen_tag = None
-            return
-        tag_id = seq["id"]
-        x = seq["x"]
-        angle = seq["angle"]
+        if seq is not None:
+            tag_id = seq["id"]
+            x = seq["x"]
+            angle = seq["angle"]
         # Let's just add our discoveries to the explore sequence -> we'll make it mutable via websocket later
-        if tag_id != self.last_seen_tag:
-            if tag_id not in ctrl.state.tag_discovered:
-                ctrl.state.tag_discovered[tag_id] = [x, angle]
-                ctrl.state.tag_explore_sequence.append[tag_id]
-                print(f"[TAG] Discovered new tag: {tag_id}")
-                print(ctrl.state.tag_discovered)
-            self.last_seen_tag = tag_id
+            if tag_id != self.last_seen_tag:
+                if tag_id not in ctrl.state.tag_discovered:
+                    ctrl.state.tag_discovered[tag_id] = [x, angle]
+                    ctrl.state.tag_explore_sequence.append(tag_id)
+                    print(f"[TAG] Discovered new tag: {tag_id}")
+                    print(ctrl.state.tag_discovered)
+                self.last_seen_tag = tag_id
+        else: 
+            self.last_seen_tag = None
 
+
+        if self.last_autonomy_toggle == 1 and ctrl.state.tag_behavior_toggle == 0:
+            ctrl.state.tag_behavior_current = 0
+            print("Exiting Autonomy Mode")
+            self.last_autonomy_toggle = 0
+        else:
+            pass
         if ctrl.state.tag_behavior_toggle == 1:
+            if self.last_autonomy_toggle == 0:
+                print("Entering autonomy")
+                self.enter_autonomy(ctrl)
+                self.last_autonomy_toggle = 1
+            else:   
+                pass
+            # Once autonomy is toggled -> we need to go into routine behavior
+            #ctrl.motors.brake_all_motors(message_toggle=False)
             submode = ctrl.state.tag_behavior_modes[ctrl.state.tag_behavior_current]
-            # Once autonomy is toggled -> we 
+            # Resting sequence -> should check sequence if haven't checked.
             if submode == "Rest":
-                ctrl.motors.brake_all_motors(message_toggle=False)
-                return
-            if submode == "Hunting":
-                if lost:
-                    ctrl.state.tag_behavior_current = ctrl.state.tag_behavior_modes.index("Lost")
-                    return
 
-            # If visible and aligned/close enough -> go docking or centering
-            # Example: if abs(angle) < 0.1 -> Centering; if distance < 0.3 -> Docking
-            # (you’ll define those thresholds)
-            return
+                if self.sequence_check_condition == False:
 
-            if submode == "Lost":
-                # do a search pattern (spin/scan)
-                # if tag reappears -> Hunting
-                if not lost:
-                    ctrl.state.tag_behavior_current = ctrl.state.tag_behavior_modes.index("Hunting")
-                return
+                    try:
+                        self.sequence_check(ctrl,ctrl.state.tag_explore_sequence)
+                    except Exception as e:
+                        print(f"Error: {e}")
+                        self.behavior_roll(ctrl)
+                        return
 
-            if submode == "Centering":
-                # center on tag angle
-                return
+                    if self.performance_point == 0:
+                        print(
+                            "Couldn't complete sequence check"
+                        )
+                        self.behavior_roll(ctrl)
+                        return
+
+                    if self.performance_point == 1:
+                        print(
+                            "Completed sequence check, moving onto docking"
+                        )
+                        ctrl.state.tag_behavior_current = 1
+
+                elif self.sequence_check_condition == True and self.docking_check_condition == True:
+                    ctrl.motors.brake_all_motors(message_toggle=False)
+                    print(
+                        "So we're in rest mode -> nothing will go.",
+                        "Press button to intitiate startup into docking"
+                        )
+                    ctrl.state.tag_behavior_current = 3
+                    # IF BUTTON PRESS -> GO INTO DOCKING we'll leave this to be automatic for now
+                    #continue
+
 
             if submode == "Docking":
-                # drive forward until close
-                return
+                print(
+                    "Initiating docking"
+                )
+                if self.docking_check_condition == False:
+                    try:
+                        self.docking(ctrl,now,ctrl.state.tag_explore_sequence)
+                    except Exception as e:
+                        print(f"Error when docking: {e}")
+                        self.behavior_roll(ctrl)
+                        return
 
-        # If tag_behavior_current == #: -> that will mess up with our hunting sequence if detects a new tag
+                    if self.performance_point == 0:
+                        print(
+                            "Couldn't complete docking"
+                        )
+                        self.behavior_roll(ctrl)
+                        return    
+
+                    if self.performance_point == 1:
+                        print("Robot is docked")
+                        self.docking_check_condition = True
+                        ctrl.state.tag_behavior_current = 0
+        
+                elif self.docking_check_condition == True:
+                    print(
+                        "Robot is docked! Awaiting next command"
+                    )
+                    # Awaiting next command
+                    pass
+
+
+            if submode == "Hunting":
+                #print("nope")
+                pass
+                #ctrl.state.tag_behavior_current = 0
+
+

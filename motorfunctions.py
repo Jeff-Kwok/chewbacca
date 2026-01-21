@@ -2,6 +2,7 @@ from adafruit_pca9685 import PCA9685
 import busio
 import board
 import numpy as np
+import math
 #Ⱍ
 class MotorFunctions:
     def __init__(self):
@@ -205,7 +206,7 @@ class MotorFunctions:
         lateral_velocity      = (w1 + w2 - w3 - w4) / (r * 4.0)
         angular_velocity      = (w1 - w2 + w3 - w4) / (r * 4.0)
 
-        roe = np.atan2(lateral_velocity, longitudinal_velocity)
+        roe = np.arctan2(lateral_velocity, longitudinal_velocity)
         velocity_vector = math.sqrt(
             longitudinal_velocity**2 + lateral_velocity**2
         )
