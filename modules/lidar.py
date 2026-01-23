@@ -19,6 +19,14 @@ class LidarModule:
         self.zone_until = 0.0
         self.HOLD_SEC = 0.25
 
+        # ---- RATE METRICS ----
+        self._rate_lock = threading.Lock()
+        self._rx_scans = 0          # how many scans we received from iter_scans()
+        self._rx_points = 0         # total points received from iter_scans()
+        self._tx_scans = 0          # how many scans we attempted to broadcast (state/ws)
+        self._t0 = time.monotonic() # window start time
+        # ----------------------
+
     async def ws_handler(self, websocket):
         self.clients.add(websocket)
         try:
@@ -43,6 +51,37 @@ class LidarModule:
             except Exception:
                 pass
 
+    def _rate_tick(self):
+        """Print intake/broadcast rates every ~1s."""
+        now = time.monotonic()
+        with self._rate_lock:
+            dt = now - self._t0
+            if dt < 1.0:
+                return
+
+            rx_scans = self._rx_scans
+            rx_points = self._rx_points
+            tx_scans = self._tx_scans
+
+            rx_hz = rx_scans / dt
+            tx_hz = tx_scans / dt
+            pts_per_scan = (rx_points / rx_scans) if rx_scans > 0 else 0.0
+            pts_per_sec = rx_points / dt
+            '''
+            print(
+                f"[LIDAR RATE] intake={rx_hz:.2f} scans/s | "
+                f"points={pts_per_sec:.0f} pts/s | "
+                f"avg_pts/scan={pts_per_scan:.0f} | "
+                f"broadcast_attempt={tx_hz:.2f} scans/s | "
+                f"clients={len(self.clients)}"
+            )
+            '''
+            # reset window
+            self._rx_scans = 0
+            self._rx_points = 0
+            self._tx_scans = 0
+            self._t0 = now
+
     def speed_check(self, distance):
         if distance is None:
             return "far"
@@ -55,7 +94,6 @@ class LidarModule:
             return "far"
         return "far"
 
-    # This is the main function to check
     def avoid_obstacles(self, angles_list, distances_list):
         if not angles_list:
             return 0.0, 0.0
@@ -82,12 +120,25 @@ class LidarModule:
                 lidar.start_motor()
                 print("[LIDAR] Connected. Scanning...")
 
+                # Reset rate window when we start scanning
+                with self._rate_lock:
+                    self._rx_scans = 0
+                    self._rx_points = 0
+                    self._tx_scans = 0
+                    self._t0 = time.monotonic()
+
                 for scan in lidar.iter_scans():
                     if self.stop_event.is_set():
                         break
                     if not scan:
                         continue
-                    
+
+                    # ---- intake counters (from hardware/driver) ----
+                    with self._rate_lock:
+                        self._rx_scans += 1
+                        self._rx_points += len(scan)
+                    # -----------------------------------------------
+
                     intensity = [m[0] for m in scan]
                     angles_deg = [m[1] for m in scan]
                     dists_mm = [m[2] for m in scan]
@@ -100,26 +151,30 @@ class LidarModule:
                         r_m = d_mm / 1000.0
                         if r_m <= 0.0 or r_m > config.LIDAR_MAX_RANGE:
                             continue
-                        
-                        angles_rad.append(math.radians(a_deg))
+
+                        a_rad = math.radians(a_deg)
+                        angles_rad.append(a_rad)
                         ranges_m.append(r_m)
                         if r_m <= config.LIDAR_AVOID_DISTANCES["close"]:
-                            check_angles_rad.append(math.radians(a_deg))
+                            check_angles_rad.append(a_rad)
                             check_ranges_m.append(r_m)
 
                     x_sum, y_sum = self.avoid_obstacles(check_angles_rad, check_ranges_m)
-                    
-                    self.state.lidar_close = {
-                        "angles": check_angles_rad,
-                        "ranges": check_ranges_m
-                    }
+
+                    self.state.lidar_close = {"angles": check_angles_rad, "ranges": check_ranges_m}
 
                     if ranges_m and self.loop:
+                        # ---- broadcast attempt counter ----
+                        with self._rate_lock:
+                            self._tx_scans += 1
+                        # -----------------------------------
+
                         # Websocket broadcast
                         asyncio.run_coroutine_threadsafe(
                             self.broadcast_scan(angles_rad, ranges_m, intensity),
                             self.loop
                         )
+
                         # Update state with the lidar payload for the broadcaster
                         self.state.lidar_payload = {
                             "type": "scan",
@@ -128,6 +183,9 @@ class LidarModule:
                             "intensity": intensity,
                             "range_max": config.LIDAR_MAX_RANGE,
                         }
+
+                    # Print rates roughly once per second
+                    self._rate_tick()
 
             except Exception as e:
                 print(f"[LIDAR] Error: {e}. Retrying in 5 seconds...")
@@ -140,8 +198,7 @@ class LidarModule:
                         print(f"[LIDAR] Error during disconnect: {disconnect_e}")
                 self.lidar_obj = None
                 time.sleep(5)
-        
-        # Cleanup when stop_event is set
+
         print("[LIDAR] Stopping hardware...")
         if self.lidar_obj:
             try:
@@ -154,13 +211,13 @@ class LidarModule:
     async def run(self):
         self.loop = asyncio.get_running_loop()
         print(f"[LIDAR] Starting WebSocket server on {config.LIDAR_WS_PORT}")
-        
+
         t = threading.Thread(target=self.lidar_loop, daemon=True)
         t.start()
-        
+
         async with websockets.serve(self.ws_handler, "0.0.0.0", config.LIDAR_WS_PORT):
             try:
-                await asyncio.Future()  # Run forever until cancelled
+                await asyncio.Future()
             except asyncio.CancelledError:
                 pass
             finally:

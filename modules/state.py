@@ -83,3 +83,8 @@ class RobotState:
         }
         # Safe Motor Commands (Calculated by SafetyModule)
         self.safe_axes = {"LX": 0.0, "LY": 0.0,"W":0.0}
+        # Translational Coordinates
+        self.tf_pose = None
+        self.tf_map_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        self.tf_last_time = 0.0
+        self.command_vector = {"LX":00, "LY":0.0, "W":0.0}

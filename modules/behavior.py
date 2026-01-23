@@ -40,9 +40,9 @@ class Manual(BehaviorBase):
         ctrl.motors.brake_all_motors(message_toggle=False)
     def hunt(self, ctrl, dt):
         # drive based on joystick
-        x  = ctrl.state.safe_axes["LX"]
+        x  = ctrl.state.safe_axes["LX"] 
         y  = ctrl.state.safe_axes["LY"]
-        rx = ctrl.state.axes["RX"] * -1
+        rx = ctrl.state.axes["RX"] * -1 # negative when sending to calculate with robot yaw function
         ry = ctrl.state.axes["RY"]
         yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
         if ctrl.state.triggers["LT"] == 1:
@@ -76,9 +76,9 @@ class Follower(BehaviorBase):
     def hunt(self, ctrl, dt):
         # follow logic here
         angle = ctrl.state.hunted["angle"] %(2*np.pi)
-        distance = 0.9
+        distance = ctrl.state.hunted["distance"]
         yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
-        if distance <= 0.2:
+        if distance <= 1.5:
             ctrl.motors.brake_all_motors(message_toggle=False)  # optional
             return
         w,val = ctrl.motors.calc_robot_yaw(0,angle)
@@ -94,7 +94,9 @@ class Follower(BehaviorBase):
             y = 0
         if abs(w) <= 0.040:
             w = 0 
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, w)
+        ctrl.state.command_vector["x"] = x * .45
+        ctrl.state.command_vector["x"] = y * .45
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"],ctrl.state.safe_axes["LY"], w*.2)
         print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
@@ -127,14 +129,11 @@ class Tag(BehaviorBase):
 
     def docking(self,ctrl,dt,sequence):
         # Where are we right now
-        # Sequence CHECKS  
+        # Sequence CHECK
+        home = [sequence["object_38"]["seen_from"]["x"],sequence["object_38"]["seen_from"]["y"]]  
         try: 
-            print(dt)
-            print(sequence)
-            print(
-                    f"Our home is: {sequence[0]}"
-                    f"Now moving towards: {sequence[0]}"
-                )
+            print(home)
+            #if ctrl.state.tf_map_pose.get("x")
             self.performance_point = 1
             # while True:
                 # If robot position not == home:
@@ -187,24 +186,64 @@ class Tag(BehaviorBase):
         )
 
     def hunt(self, ctrl, dt):
-        # tag hunt logic here
+            # tag hunt logic here
         now = time.monotonic()
         seq = ctrl.state.tag_sequence
-        #print(seq)
-        if seq is not None:
-            tag_id = seq["id"]
-            x = seq["x"]
-            angle = seq["angle"]
-        # Let's just add our discoveries to the explore sequence -> we'll make it mutable via websocket later
-            if tag_id != self.last_seen_tag:
-                if tag_id not in ctrl.state.tag_discovered:
-                    ctrl.state.tag_discovered[tag_id] = [x, angle]
-                    ctrl.state.tag_explore_sequence.append(tag_id)
-                    print(f"[TAG] Discovered new tag: {tag_id}")
-                    print(ctrl.state.tag_discovered)
-                self.last_seen_tag = tag_id
-        else: 
+
+        # --- TF pose (dict) ---
+        loq_x = float(ctrl.state.tf_map_pose.get("x", 0.0))
+        loq_y = float(ctrl.state.tf_map_pose.get("y", 0.0))
+        loq_yaw = float(ctrl.state.tf_map_pose.get("yaw", 0.0))
+
+        # --- Dpad save button ---
+        dpad = ctrl.state.buttons.get("DPAD_UP", None)
+
+        # Pick which direction is "save"
+        SAVE_DPAD = 1
+
+        # --- edge detect: only trigger once per press ---
+        if not hasattr(self, "_prev_dpad"):
+            self._prev_dpad = None
+
+        save_pressed = (dpad == SAVE_DPAD) and (self._prev_dpad != SAVE_DPAD)
+        self._prev_dpad = dpad
+
+        # No tag seen -> nothing to save
+        if seq is None:
             self.last_seen_tag = None
+            return
+
+        # Tag data
+        tag_id = seq.get("id")
+        tag_x = seq.get("x")
+        tag_angle = seq.get("angle")
+
+        if tag_id is None:
+            return
+
+        # Track last seen tag (optional)
+        if tag_id != getattr(self, "last_seen_tag", None):
+            self.last_seen_tag = tag_id
+
+        # --- Only save when button is pressed ---
+        if save_pressed:
+            # Store "seen-from" location (map frame) + tag observation info
+            # If you press again on same tag, this overwrites (updates).
+            ctrl.state.tag_discovered[tag_id] = {
+                "seen_from": {"x": loq_x, "y": loq_y, "yaw": loq_yaw},
+                "tag_obs": {"x": tag_x, "angle": tag_angle},
+                "t": now,
+            }
+
+            # Add to explore sequence only once (don’t duplicate)
+            if tag_id not in ctrl.state.tag_explore_sequence:
+                ctrl.state.tag_explore_sequence.append(tag_id)
+
+            print(f"[TAG] Saved/Updated tag {tag_id} @ map(x={loq_x:.2f}, y={loq_y:.2f}, yaw={loq_yaw:.2f})")
+            # Optional: print full dict
+            print(ctrl.state.tag_discovered[tag_id])
+            print(ctrl.state.tag_discovered)
+
 
 
         if self.last_autonomy_toggle == 1 and ctrl.state.tag_behavior_toggle == 0:

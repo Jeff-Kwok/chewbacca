@@ -1,3 +1,6 @@
+'''
+This config is for immutable settings that need to be referenced but not changed. It should be default settings for getting things running.
+'''
 # Network Configuration
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 5456    # controller UDP
@@ -9,6 +12,7 @@ SEND_IP = "192.168.30.227"
 
 # UDP Broadcaster
 UDP_BROADCASTER_IP = "127.0.0.1"
+UDP_INTAKE_ROS2_PORT = 9543
 UDP_BROADCASTER_PORT_LIDAR = 9547
 UDP_BROADCASTER_PORT_STM_ODOM = 9548
 UDP_BROADCASTER_PORT_STM_IMU = 9549
@@ -69,3 +73,4 @@ AT_QUAD_SIGMA = 0.8
 AT_REFINE_EDGES = 1
 AT_DECODE_SHARPENING = 0.25
 AT_DEBUG = 0
+

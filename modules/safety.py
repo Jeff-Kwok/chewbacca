@@ -11,6 +11,8 @@ class SafetyModule:
         return(self.angle_wrap(a-b))
     async def run(self):
         print("[SAFETY] Listening for close obstacles and controller inputs...")
+        lx = 0
+        ly = 0
         count = 0
         scale = 0
         rep_x = 0
@@ -28,8 +30,14 @@ class SafetyModule:
             #print(close_angles)
 
             # Receive Controller axes
-            lx = self.state.axes["LX"] * -1 # Orientation
-            ly = self.state.axes["LY"]
+            if self.state.robot_current == 1:
+                lx = self.state.axes["LX"] * -1 # Orientation
+                ly = self.state.axes["LY"]
+            elif self.state.robot_current == 2:
+                lx = self.state.command_vector["LX"] * -1 # Orientation
+                ly = self.state.command_vector["LY"]
+            elif self.state.robot_current == 3:
+                pass
 
             # All points that are too close 
             too_close = np.asarray(close_ranges,dtype=float) <= 1.2

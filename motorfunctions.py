@@ -200,28 +200,30 @@ class MotorFunctions:
         Approximate robot-frame velocities from wheel angular velocities.
         NOTE: formulas may need tweaking; dimensions not fully checked.
         """
+        # OUr use case is w1 = rl, w2 = fl, w3 = fr, w4 = rr
         r = self.mecanum_configuration["wheel_diameter"] / 2.0
+        # wfl + wfr + wrl + wrr
+        longitudinal_velocity = (w1 + w2 + w3 + w4) * (r / 4.0) # -> This reports in m/s
+        # -wl + wfr + wrl - wrr
+        lateral_velocity      = (w1 - w2 + w3 - w4) * (r / 4.0) # -> This reports in m/s
+        # May need to change
+        # -wl + wfr - wrl + wrr
+        angular_velocity      = (-w1 - w2 + w3 + w4) * (r / 4.0*(longitudinal_velocity+lateral_velocity))
+        #print(-w1 -w2 + w3 +w4)
+        #print(angular_velocity)
+        #roe = np.arctan2(lateral_velocity, longitudinal_velocity)
 
-        longitudinal_velocity = (w1 + w2 + w3 + w4) / (r * 4.0)
-        lateral_velocity      = (w1 + w2 - w3 - w4) / (r * 4.0)
-        angular_velocity      = (w1 - w2 + w3 - w4) / (r * 4.0)
-
-        roe = np.arctan2(lateral_velocity, longitudinal_velocity)
-        velocity_vector = math.sqrt(
-            longitudinal_velocity**2 + lateral_velocity**2
-        )
-
-        return longitudinal_velocity, lateral_velocity, angular_velocity, roe, velocity_vector
+        return longitudinal_velocity, lateral_velocity, angular_velocity#, roe
     # Plugging in radians from 0 2*pi
     def calc_robot_yaw(self,desired,reading):
         w_rate = 0
         value = ((desired - reading) + 2*np.pi) % (2*np.pi)
-        if abs(value) >= np.deg2rad(6.5):
+        if abs(value) >= np.deg2rad(2.5):
             if value < np.pi:
-                w_rate = (value/np.pi)*.5
+                w_rate = (value/np.pi)*.6
             elif value > np.pi:
                 # Subtracting because we're looking from 0 to 3.14 -> already established over threshold so we jus tneed magnitude
-                w_rate = ((value-2*np.pi)/np.pi)*.5
+                w_rate = ((value-2*np.pi)/np.pi)*.6
         else:
             w_rate = 0
         return w_rate,value       

@@ -17,6 +17,7 @@ from .lidar import LidarModule
 from .core_control import ControlLoop
 from .safety import SafetyModule
 from .udp_broadcaster import UdpBroadcaster
+from .translational_listener import TranslationListener
 
 async def camera_loop(state: RobotState):
     """
@@ -99,6 +100,7 @@ async def main():
     core_mod = ControlLoop(state, motors)
     safety_mod = SafetyModule(state)
     broadcaster_mod = UdpBroadcaster(state,motors)
+    translation = TranslationListener("0.0.0.0",9543,state)
     
     print("Starting all modules...")
     try:
@@ -110,6 +112,7 @@ async def main():
             lidar_mod.run(),
             safety_mod.run(),
             broadcaster_mod.run(),
+            translation.run(),
         )
     finally:
         # Cleanup
