@@ -12,6 +12,10 @@ class RobotState:
             "mx": 0.0, "my": 0.0, "mz": 0.0,
             "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 0.0
         }
+        # Initial yaw reading
+        self.yaw = 0.0
+
+
         # Controller Inputs
         self.axes = {"LX": 0.0, "LY": 0.0, "RX": 0.0, "RY": 0.0}
         self.triggers = {"LT": 0.0, "RT": 0.0}
@@ -36,10 +40,13 @@ class RobotState:
         self.tag_behavior_modes = ["Rest","Docking","Lost","Hunting","Centering"]
         self.tag_behavior_current = 0
         self.tag_behavior_toggle = 0
+        # What we currently see
         self.tag_sequence = []
+        # The whole dictionary
         self.tag_discovered = {}
+        # The list of phrases within the dictionary by order of append
         self.tag_explore_sequence = []
-        self.tag_current = None
+
 
 
         # Lidar Zone
@@ -85,6 +92,8 @@ class RobotState:
         self.safe_axes = {"LX": 0.0, "LY": 0.0,"W":0.0}
         # Translational Coordinates
         self.tf_pose = None
+        # The starting position will always be 0,0,0
         self.tf_map_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         self.tf_last_time = 0.0
+
         self.command_vector = {"LX":00, "LY":0.0, "W":0.0}

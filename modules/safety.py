@@ -37,7 +37,8 @@ class SafetyModule:
                 lx = self.state.command_vector["LX"] * -1 # Orientation
                 ly = self.state.command_vector["LY"]
             elif self.state.robot_current == 3:
-                pass
+                lx = self.state.command_vector["LX"] * -1 # Orientation
+                ly = self.state.command_vector["LY"]
 
             # All points that are too close 
             too_close = np.asarray(close_ranges,dtype=float) <= 1.2

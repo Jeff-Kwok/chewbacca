@@ -38,6 +38,8 @@ class MotorFunctions:
             "angular_velocity_max": 7.483,
             "max_rad/s":            34.56,
             "real_max_rad/s":       34.56,
+            "position_tolerance": 0.160,
+            "yaw_tolerance": 0.3,
         }
 
     def set_direction_pins(self, wheel, pinA, pinB, pwm):
@@ -128,7 +130,6 @@ class MotorFunctions:
             "nfr": speeds,
             "nfl": -speeds,
         })
-    
     def drive_all_forward(self,speeds):
         self.drive_all_wheels({
             "nrr": speeds,
@@ -136,7 +137,6 @@ class MotorFunctions:
             "nfr": speeds,
             "nfl": speeds,
         })
-    
     def drive_all_backwards(self,speeds):
         self.drive_all_wheels({
             "nrr": -speeds,
@@ -227,10 +227,36 @@ class MotorFunctions:
         else:
             w_rate = 0
         return w_rate,value       
+    def calc_robot_desired_pos(self,x1,y1,x2,y2,yaw1,yaw2):
+        x_diff = x2 - x1
+        y_diff = y2 - y1 
+        # Distance should always be positive
+        dist = math.hypot(abs(x_diff),abs(y_diff))
+        print(dist)
+        if dist >= self.mecanum_configuration["position_tolerance"]:
+            # Scalar scaling -> Using desmos to see the curve at 3m we're operating 70 any close we're quickly going to 10%
+            # Edit the curve below
+            scale = max(0.0, min(1.0,(1.0-math.exp(-1.2 * dist)))) # Clamping just in case but it hsouldn't ever go above 1 anyway
+            x_vector = np.cos(yaw1)*x_diff + np.sin(yaw1)*y_diff
+            y_vector = -np.sin(yaw1)*x_diff + np.cos(yaw1)*y_diff
+            dist = math.hypot(x_vector,y_vector)
+            x_vector = max(-1.0,min(1.0,(x_vector / dist) * scale))
+            y_vector = max(-1.0,min(1.0,(y_vector / dist) * scale))
+        else:
+            x_vector = 0.0
+            y_vector = 0.0
+        yaw_val = ((yaw2-yaw1) + np.pi) % (2*np.pi) - np.pi
+        if abs(yaw_val) <= self.mecanum_configuration["yaw_tolerance"]:
+            yaw_vector = 0.0
+        else:
+            yaw_vector =max(0.0, min(1.0,(1.0-math.exp(-0.4 * abs(yaw_val))))) # Clamping just in case but it hsouldn't ever go above 1 anyway
+            yaw_vector = math.copysign(yaw_vector,yaw_val)
+        return x_vector, y_vector, yaw_vector
+    
+    
     def read_device_encoder(self, device):
         # Placeholder for reading device encoder values
         pass
-
 
 class PID:
     def __init__(self):
