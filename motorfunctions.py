@@ -236,7 +236,7 @@ class MotorFunctions:
         if dist >= self.mecanum_configuration["position_tolerance"]:
             # Scalar scaling -> Using desmos to see the curve at 3m we're operating 70 any close we're quickly going to 10%
             # Edit the curve below
-            scale = max(0.0, min(1.0,(1.0-math.exp(-1.2 * dist)))) # Clamping just in case but it hsouldn't ever go above 1 anyway
+            scale = max(0.2, min(1.0,(1.0-math.exp(-.9 * dist)))) # Clamping just in case but it hsouldn't ever go above 1 anyway
             x_vector = np.cos(yaw1)*x_diff + np.sin(yaw1)*y_diff
             y_vector = -np.sin(yaw1)*x_diff + np.cos(yaw1)*y_diff
             dist = math.hypot(x_vector,y_vector)

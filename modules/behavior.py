@@ -19,7 +19,6 @@ class BehaviorBase:
     def hunt(self, ctrl, dt):   # active driving
         raise NotImplementedError
 
-
 class Rest(BehaviorBase):
     name = "Rest"
     def stop(self, ctrl, dt):
@@ -33,7 +32,6 @@ class Rest(BehaviorBase):
         self.stop(ctrl, dt)
         #print(ctrl.state.tf_map_pose)
         #print(ctrl.state.tf_pose)
-
 
 class Manual(BehaviorBase):
     name = "Manual"
@@ -60,7 +58,6 @@ class Manual(BehaviorBase):
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
             })
-
 
 class Follower(BehaviorBase):
     name = "Follower"
@@ -120,30 +117,28 @@ class Tag(BehaviorBase):
         }
         self.explore_condition = []
         self.explore_index = 0
+        self._prev_submode = None
+        self.retry_index = 1
 
     
     def stop(self, ctrl, dt):
         ctrl.state.camera_current = 0
         ctrl.motors.brake_all_motors(message_toggle=False)
-
     def on_enter(self,ctrl):
         ctrl.state.camera_current = 2
         print(ctrl.state.camera_modes[ctrl.state.camera_current])
     ## On leave
     def enter_autonomy(self, ctrl):
-        print("[AUTO] Entering tag autonomy")
+        print("[AUTO] Switching tag autonomy states | All behaviors are stopped and we will be at rest.")
         ctrl.motors.brake_all_motors(message_toggle=False)
         self.performance_point = 0
         ctrl.state.tag_behavior_current = ctrl.state.tag_behavior_modes.index("Rest")
-
-    def checking_position_move(self,ctrl,num,move):
-        # We can have this condition be one-flipped if it doesn't need to be iterated over
+    def checking_position_move(self,ctrl,num,move,performance_set):
+        self.performance_point = performance_set
         try:
             sequence = ctrl.state.tag_explore_sequence
             tag_id = sequence[num]
-            print(
-                f"Our goal tag is: {tag_id}"
-            )
+            print(f"Our goal tag is: {tag_id}")
             self.point_goal["x"] = ctrl.state.tag_discovered[tag_id]["seen_from"]["x"]
             self.point_goal["y"] = ctrl.state.tag_discovered[tag_id]["seen_from"]["y"]
             self.point_goal["yaw"] = ctrl.state.tag_discovered[tag_id]["seen_from"]["yaw"]
@@ -154,6 +149,7 @@ class Tag(BehaviorBase):
         if tag_id is not None:
             try: 
                 x, y, yaw = ctrl.motors.calc_robot_desired_pos(ctrl.state.tf_map_pose["x"],ctrl.state.tf_map_pose["y"],self.point_goal["x"],self.point_goal["y"],ctrl.state.tf_map_pose["yaw"],self.point_goal["yaw"])
+                # If our movement command is non-zero we know that we need to move thus we're not at position[tag_id]
                 if x == 0.0 and y == 0.0 and yaw == 0.0:
                     print(
                         "Arrived at:"
@@ -163,32 +159,32 @@ class Tag(BehaviorBase):
                         )
                     self.performance_point = 1
                     return
+                else:
+                    print(f"x: {x:.2f} | y: {y:.2f} | yaw: {yaw:.2f}")
                 if move == True:
                     try:
+                        # need to fix this for collision avoidance
                         ctrl.state.command_vector["LX"] = y
                         ctrl.state.command_vector["LY"] = x
                         print("Moving")
-                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"], ctrl.state.safe_axes["LY"], yaw*-.25)
+                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(y*-1, x, yaw*-.25)
                         ctrl.motors.drive_all_wheels({
                                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
                             })
                     except Exception as e:
-                        print(
-                            f"Error: {e}"
-                        )
-                print(x,y,yaw)
+                        print(f"Error: {e}")
+                return x,y,yaw
             except Exception as e:
                 self.performance_point = 0
                 print(e)
                 return
     def checking_docking_pos(self,ctrl):
-        self.checking_position_move(ctrl,0,move=False)
-        self.performance_point = 0.5
-        if self.performance_point == 0:
+        # CHECK IF WE ALREADY ARE AT POSITION 0 WITHOUT MOVING
+        self.checking_position_move(ctrl,0,move=False,0.5)
+        if self.performance_point == 0.5:
             self.docking_check_condition = False
         elif self.performance_point == 1:
             self.docking_check_condition = True
-
     def mode_change_button(self,ctrl,left_state,right_state):
         print(
             f"press dpad left to go: {ctrl.state.tag_behavior_modes[left_state]}\n"
@@ -198,8 +194,10 @@ class Tag(BehaviorBase):
         dpad_RIGHT = ctrl.state.buttons.get("DPAD_RIGHT", None)
         dpad_LEFT = ctrl.state.buttons.get("DPAD_LEFT", None)
         if dpad_RIGHT == 1:
+            self._prev_submode = ctrl.state.tag_behavior_current
             ctrl.state.tag_behavior_current = right_state
         elif dpad_LEFT == 1:
+            self._prev_submode = ctrl.state.tag_behavior_current
             ctrl.state.tag_behavior_current = left_state
     # DEFINE MOVEMENT FUNCTION -> PULLS FROM MOTOR
     
@@ -232,36 +230,30 @@ class Tag(BehaviorBase):
         )
 
     def hunt(self, ctrl, dt):
-            # tag hunt logic here
+        # tag hunt logic here
         now = time.monotonic()
         seq = ctrl.state.tag_sequence
-
         # --- TF pose (dict) ---
-        loq_x = float(ctrl.state.tf_map_pose.get("x", 0.0))
-        loq_y = float(ctrl.state.tf_map_pose.get("y", 0.0))
-        loq_yaw = float(ctrl.state.tf_map_pose.get("yaw", 0.0))
-
+        loq_x,loq_y,loq_yaw = float(ctrl.state.tf_map_pose.get("x", 0.0)),float(ctrl.state.tf_map_pose.get("y", 0.0)),float(ctrl.state.tf_map_pose.get("yaw", 0.0))
         # --- Dpad save button ---
-        dpad = ctrl.state.buttons.get("DPAD_UP", None)
+        dpad_up, dpad_down = ctrl.state.buttons.get("DPAD_UP", None),ctrl.state.buttons.get("DPAD_DOWN", None)
 
-        # Pick which direction is "save"
-        SAVE_DPAD = 1
-
-        # --- edge detect: only trigger once per press ---
-        if not hasattr(self, "_prev_dpad"):
-            self._prev_dpad = None
-
-        save_pressed = (dpad == SAVE_DPAD) and (self._prev_dpad != SAVE_DPAD)
-        self._prev_dpad = dpad
+        # THUMB BAD FOR CONTROLLING ENTRY OF TAG SEQUENCES
+        if not hasattr(self, "_prev_dpad_up"):
+            self._prev_dpad_up = 0
+        if not hasattr(self, "_prev_dpad_down"):
+            self._prev_dpad_down = 0
+        save_pressed   = (dpad_up   == 1) and (self._prev_dpad_up   != 1)
+        delete_pressed = (dpad_down == 1) and (self._prev_dpad_down != 1)
+        self._prev_dpad_up   = dpad_up
+        self._prev_dpad_down = dpad_down
 
         # No tag seen -> nothing to save
         if seq is None:
             self.last_seen_tag = None
         else:
             # Tag data
-            tag_id = seq.get("id")
-            tag_x = seq.get("x")
-            tag_angle = seq.get("angle")
+            tag_id,tag_x,tag_angle  = seq.get("id"), seq.get("x"), seq.get("angle")
             if tag_id is None:
                 return
             # Track last seen tag (optional)
@@ -283,31 +275,52 @@ class Tag(BehaviorBase):
                     ctrl.state.tag_explore_sequence.append(tag_id)
 
                 print(f"[TAG] Saved/Updated tag {tag_id} @ map(x={loq_x:.2f}, y={loq_y:.2f}, yaw={loq_yaw:.2f})")
-                # Optional: print full dict
                 # The definition for phrase
                 print(ctrl.state.tag_discovered[tag_id])
                 # The whole dictionary
                 print(ctrl.state.tag_discovered)
                 # The list of phrases
                 print(ctrl.state.tag_explore_sequence)
+        
+            elif delete_pressed:
+                # Remove from discovered dict (if exists)
+                if tag_id in ctrl.state.tag_discovered:
+                    removed = ctrl.state.tag_discovered.pop(tag_id, None)
+                    print(f"[TAG] Removed tag_discovered[{tag_id}] -> {removed is not None}")
+                else:
+                    print(f"[TAG] Tag {tag_id} not in tag_discovered")
 
+                # Remove from explore sequence (all occurrences, just in case)
+                if tag_id in ctrl.state.tag_explore_sequence:
+                    ctrl.state.tag_explore_sequence = [t for t in ctrl.state.tag_explore_sequence if t != tag_id]
+                    print(f"[TAG] Removed {tag_id} from tag_explore_sequence")
+                else:
+                    print(f"[TAG] Tag {tag_id} not in tag_explore_sequence")
 
+                # Optional: show current state
+                print("[TAG] tag_explore_sequence:", ctrl.state.tag_explore_sequence)
+                print("[TAG] tag_discovered keys:", list(ctrl.state.tag_discovered.keys()))
 
         if self.last_autonomy_toggle == 1 and ctrl.state.tag_behavior_toggle == 0:
-            ctrl.state.tag_behavior_current = 0
-            print("Exiting Autonomy Mode")
+            # Setting t
+            self.enter_autonomy(ctrl)
             self.last_autonomy_toggle = 0
+            print("Exiting Autonomy Mode")
         if ctrl.state.tag_behavior_toggle == 1:
             if self.last_autonomy_toggle == 0:
-                print("Entering autonomy")
                 self.enter_autonomy(ctrl)
                 self.last_autonomy_toggle = 1
+                print("Entering autonomy")
             else:   
-                print("doing nothing")
+                print("Error switching states - you should always get an entering/exit message if not break loop")
+                break
             # Once autonomy is toggled -> we need to go into routine behavior
-            #ctrl.motors.brake_all_motors(message_toggle=False)
             submode = ctrl.state.tag_behavior_modes[ctrl.state.tag_behavior_current]
-            # Resting sequence -> should check sequence if haven't checked.
+
+            ###### NO BREAK LOOPS OTHERWISE WE STOP OUR CAMERA LOOP #####
+
+            # RESTING SEQUENCE -> VALIDATE TAG SEQUENCE TO MEET THRESHOLD.
+            # ONCE TAG SEQUENCE HAS BEEN VALIDATED -> AUTOMATICALLY GO INTO DOCKING
             if submode == "Rest":
                 self.checking_docking_pos(ctrl)
                 if self.sequence_check_condition == False:
@@ -324,78 +337,105 @@ class Tag(BehaviorBase):
                         return
 
                     if self.performance_point == 1:
-                        print("Completed sequence check, moving onto docking")
                         self.sequence_check_condition = True
+                        self._prev_submode = ctrl.state.tag_behavior_current
                         ctrl.state.tag_behavior_current = 1
+                        print("Completed sequence check, moving onto docking")
 
-                if self.sequence_check_condition == True:
-                    self.mode_change_button(ctrl,1,3)          
+                #elif self.docking_check_condition == False:
+                #    ctrl.state.tag_behavior_current = 1 # If we know sequence check is true and docking is false -> send it into docking | We only idle at docking
+                else:
+                    self.mode_change_button(ctrl,1,3) # If we know sequence check is true and we aren't docked -> we can send to docking or hunting
 
-
+            # DOCKING SEQUENCE -> RETURN TO INITIAL TAG
+            # 
             if submode == "Docking":
-                print("Initiating docking")
-                self.checking_docking_pos(ctrl)
+                self.checking_docking_pos(ctrl) # WE CHECK IF WE ARE ALREADY AT DOCKING POSITION
                 if self.docking_check_condition == False:
                     try:
-                        self.performance_point = 0.5
-                        self.checking_position_move(ctrl,0,move=True)
+                        self.checking_position_move(ctrl,0,move=True,0.5)
                     except Exception as e:
-                        print(f"Error when docking: {e}")
                         self.behavior_roll(ctrl)
+                        print(f"Error when docking: {e}")
                         return
                     if self.performance_point == 0:
-                        # If we are IN docking -> and we can't succeed, go to lost
-                        print("Couldn't complete docking")
+                        # IF we can't succeed in docking go into "LOST"
+                        self._prev_submode = ctrl.state.tag_behavior_current
                         ctrl.state.tag_behavior_current = 2
+                        print("Couldn't complete docking")
                         return
                         # If we are IN docking -> and we succeed, set condition to true go back to rest
                     if self.performance_point == 1:
                         print("Robot is docked")
                         self.docking_check_condition = True
-        
+                        return
                 elif self.docking_check_condition == True:
-                    self.mode_change_button(ctrl,0,3)                   
+                    self.mode_change_button(ctrl,0,3) # IF WE PICK 0 HERE -> We SHOULD IDLE AT REST
 
 
             # In submode hunting -> As long as we're docked and our sequence has been checked -> we're going to start exploring the sequence
             if submode == "Hunting":
-                print(
-                    "Initiating Hunting"
-                )
                 self.checking_docking_pos(ctrl)
-                if self.sequence_check_condition == True:
-                    # For every tag in sequence we're going to try to go to them, if it any point we encounter an issue, we know we're no longer docked -> and we go to lost
-                    if len(self.explore_condition) != len(ctrl.state.tag_explore_sequence):
-                        try:
-                            self.performance_point = 0.5
-                            self.checking_position_move(ctrl,self.explore_index,move=True)
-                            if self.performance_point == 0:
-                                ctrl.state.tag_behavior_current = 2
-                                return
-                            if self.performance_point == 1:
-                                self.explore_condition.append(ctrl.state.tag_explore_sequence[self.explore_index])
-                                self.explore_index += 1
-                        except Exception as e:
-                            print(f"Error: {e}")
-                    else: 
-                        print("press dpad right to go docking hunt")
-                        print("press dpad left to go sleep")
-                                            # --- Dpad save button ---
-                        dpad_RIGHT = ctrl.state.buttons.get("DPAD_RIGHT", None)
-                        dpad_LEFT = ctrl.state.buttons.get("DPAD_LEFT", None)
-                        if dpad_RIGHT == 1:
-                            self.explore_index = 0
-                            print(self.explore_condition)
-                            self.explore_condition = []
-                            ctrl.state.tag_behavior_current = 1
+                # if self.sequence_check_condition == True:
+                # For every tag in sequence we're going to try to go to them, if it any point we encounter an issue, we know we're no longer docked -> and we go to lost
+                is_docked = bool(self.docking_check_condition)
 
-                        elif dpad_LEFT == 1:
-                            ctrl.state.tag_behavior_current = 0  
+                # ----- entry detect: only run once when we ENTER hunting -----
+                if self._prev_submode != 3:
+                    if is_docked:
+                        # entering hunting from dock -> full sweep
+                        self.explore_index = 0
+                        self.explore_condition = []
+                        print("[HUNT] Entered from DOCK: start sweep from 0")
+                    else:
+                        # entering hunting from elsewhere -> resume last goal
+                        self.explore_index = getattr(self, "explore_index", 0)
+                        self.explore_condition = getattr(self, "explore_condition", [])
+                        print(f"[HUNT] Entered NOT docked: resume at index={self.explore_index}")
+                if len(self.explore_condition) != len(ctrl.state.tag_explore_sequence):
+                    try:
+                        self.checking_position_move(ctrl,self.explore_index,move=True,0.5) # Move to current EXPLORE INDEX
+                        self._prev_submode = 3
+                        if self.performance_point == 0: # If there is some error encountered we automatically go to lost
+                            ctrl.state.tag_behavior_current = 2 
+                            return
+                        if self.performance_point == 1:
+                            if ctrl.state.tag_explore_sequence[self.explore_index] not in self.explore_condition:
+                                self.explore_condition.append(ctrl.state.tag_explore_sequence[self.explore_index]) # Only increase the EXPLORE INDEX upon hitting a successful venture
+                            self.explore_index = min(len(ctrl.state.tag_explore_sequence),(self.explore_index + 1)) # The explore index should always be the last goal set. It is only reset if we docked. Otherwise it will always try to finish the sequence.
+                            print(self.explore_condition) # This should be the tags that we've passed by
+                            return
+                    except Exception as e:
+                        print(f"Error: {e}")
+                        self.behavior_roll(ctrl)
+                        return
+                else: 
+                    self.mode_change_button(ctrl,0,1) # IF WE PICK 0 HERE -> We SHOULD IDLE AT REST. If we've already explored all the tags when entering hunting we can go docking to restart the behavior
 
+
+                        
             if submode == "Lost":
                 # Set both sequence and docking checkst o false and return to rest -> begin docking loop.
-                self.sequence_check_condition = False
-                self.docking_check_condition = False
-                ctrl.state.tag_behavior_current = 0
+                if self._prev_submode == 1:
+                    self.sequence_check_condition = False
+                    self._prev_submode = ctrl.state.tag_behavior_current
+                    ctrl.state.tag_behavior_current = 0
+                    return
+                if self._prev_submode == 3:
+                    if self.retry_index < (len(self.explore_condition)-1) and self.retry_index < self.explore_index: # Coming from hunting and we haven't retried at all
+                        try:
+                            self.explore_index -= 1 
+                            self._prev_submode = ctrl.state.tag_behavior_current
+                            ctrl.state.tag_behavior_current = 3
+                            self.retry_index += 1
+                        except Exception as e:
+                            print(f"Error: {e}")
+                            self.behavior_roll(ctrl)
+                            return
+                    else: 
+                        self.retry_index = 1
+                        self._prev_submode = ctrl.state.tag_behavior_current
+                        ctrl.state.tag_behavior_current = 0
+                        print("Couldn't make it back")
                 print("I'm lost!")
 
