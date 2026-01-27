@@ -49,7 +49,7 @@ class RobotState:
         # Lidar Zone
         self.zone = {"zone": "Far", "x_sum": 0.0, "y_sum": 0.0}
         # Lidar Close Data (Points <= close distance)
-        self.lidar_close = {"angles": [], "ranges": []}
+        self.lidar_close = {"angles": [], "ranges": [], "clusters": []}
         # Lidar Full Scan
         self.lidar_full_scan = {}
         # Lidar Payload for UDP

@@ -15,9 +15,6 @@ class LidarModule:
         self.stop_event = threading.Event()
         self.lidar_obj = None
         self.loop = None
-        self.zone_latched = "far"
-        self.zone_until = 0.0
-        self.HOLD_SEC = 0.25
 
         # ---- RATE METRICS ----
         self._rate_lock = threading.Lock()
@@ -82,34 +79,60 @@ class LidarModule:
             self._tx_scans = 0
             self._t0 = now
 
-    def speed_check(self, distance):
-        if distance is None:
-            return "far"
-        dists = config.LIDAR_AVOID_DISTANCES
-        if distance <= dists["close"]:
-            return "close"
-        elif distance <= dists["middle"]:
-            return "middle"
-        elif distance <= dists["far"]:
-            return "far"
-        return "far"
+    # ---------------- GAP FILLER (added) ----------------
+    def angle_diff(self, a, b):
+        """Wrap-safe signed difference a-b in radians, in [-pi, pi]."""
+        return (a - b + math.pi) % (2.0 * math.pi) - math.pi
 
-    def avoid_obstacles(self, angles_list, distances_list):
-        if not angles_list:
-            return 0.0, 0.0
-        x_sum = 0.0
-        y_sum = 0.0
-        w_sum = 0.0
-        for a, r in zip(angles_list, distances_list):
-            w = max((2.0 - r) / 2.0, 0.0)
-            if w == 0.0:
-                continue
-            y_sum += w * np.sin(a)
-            x_sum += w * np.cos(a)
-            w_sum += w
-        if w_sum == 0.0:
-            return 0.0, 0.0
-        return -x_sum / w_sum, -y_sum / w_sum
+    def fill_angle_gaps(self, angles_rad, ranges_m,
+                        angle_step_deg=0.5,
+                        max_fill_gap_deg=10.0,
+                        dist_gap_m=0.5):
+        """
+        Insert artificial points between consecutive (angle,range) samples
+        when:
+          - angular gap is > angle_step and <= max_fill_gap
+          - range change is small (|dr| < dist_gap_m)
+        Returns (filled_angles, filled_ranges).
+        """
+        if not angles_rad or len(angles_rad) != len(ranges_m) or len(angles_rad) < 2:
+            return angles_rad, ranges_m, []
+
+        # Ensure monotonic ordering by angle (helps segmentation/filling)
+        order = np.argsort(np.asarray(angles_rad))
+        a = np.asarray(angles_rad, dtype=float)[order]
+        r = np.asarray(ranges_m, dtype=float)[order]
+
+        angle_step = math.radians(angle_step_deg)
+        max_fill_gap = math.radians(max_fill_gap_deg)
+
+        filled_a = [float(a[0])]
+        filled_r = [float(r[0])]
+        clusters = []
+        for i in range(1, len(a)):
+            a0, r0 = filled_a[-1], filled_r[-1]
+            a1, r1 = float(a[i]), float(r[i])
+
+            da = self.angle_diff(a1, a0)   # signed shortest path
+            abs_da = abs(da)
+            dr = r1 - r0
+
+            # Fill only for moderate gaps + similar distance
+            if abs_da > angle_step and abs_da <= max_fill_gap and abs(dr) < dist_gap_m:
+                clusters.append([[a1,a0],[r1,r0]])
+                n = int(abs_da // angle_step)  # interior points count
+                for k in range(1, n + 1):
+                    t = k / (n + 1)
+                    aa = a0 + da * t
+                    rr = r0 + dr * t
+                    filled_a.append(float(aa))
+                    filled_r.append(float(rr))
+
+            filled_a.append(a1)
+            filled_r.append(r1)
+
+        return filled_a, filled_r, clusters
+    # ----------------------------------------------------
 
     def lidar_loop(self):
         while not self.stop_event.is_set():
@@ -139,31 +162,49 @@ class LidarModule:
                         self._rx_points += len(scan)
                     # -----------------------------------------------
 
-                    intensity = [m[0] for m in scan]
-                    angles_deg = [m[1] for m in scan]
-                    dists_mm = [m[2] for m in scan]
+                    # -----------------------------------------------
+                    intensity = [m[0] for m in scan] # Raw Intensities
+                    angles_deg = [m[1] for m in scan] # Raw Angles degree 0,360
+                    dists_mm = [m[2] for m in scan] # Raw Distances in millimeter
                     angles_rad = []
+                    angles_ros = []
                     ranges_m = []
                     check_angles_rad = []
                     check_ranges_m = []
+                    # -----------------------------------------------
 
                     for a_deg, d_mm in zip(angles_deg, dists_mm):
-                        r_m = d_mm / 1000.0
+                        r_m = d_mm / 1000.0 # Converting for each distance
                         if r_m <= 0.0 or r_m > config.LIDAR_MAX_RANGE:
-                            continue
+                            continue # Ends current iteration of the loop -> If we have a value <0 or greater than max range we skip
+                            # According to RPLIDAR it's 0 when the measurement is invalid.
 
-                        a_rad = math.radians(a_deg)
-                        angles_rad.append(a_rad)
-                        ranges_m.append(r_m)
-                        if r_m <= config.LIDAR_AVOID_DISTANCES["close"]:
-                            check_angles_rad.append(a_rad)
-                            check_ranges_m.append(r_m)
+                        a_rad = (math.radians(a_deg)) # The angle comes as a degree so we convert it to rads
+                        angles_rad.append(a_rad) # We append radian angle to angles_rad
+                        ranges_m.append(r_m) # We append the associated distance in meters
 
-                    x_sum, y_sum = self.avoid_obstacles(check_angles_rad, check_ranges_m)
+                    # --------- GAP FILL (added, minimal intrusion) ---------
+                    # Fill missing intermediate angles/ranges for small gaps.
+                    yaw = np.deg2rad(float(self.state.stm["yaw"])+90)
+                    angles = (np.asarray(angles_rad, dtype=float) + yaw) % (2*np.pi)
+                    angles_out = ((np.pi - angles) % (2*np.pi)).tolist()
+                    angles_filled, ranges_filled,clusters = self.fill_angle_gaps(
+                        angles_out,
+                        ranges_m,
+                        angle_step_deg=0.125,      # insert every 0.5°
+                        max_fill_gap_deg=10.0,   # don't fill if gap is huge
+                        dist_gap_m=0.5
+                    )
+                    # -------------------------------------------------------
 
-                    self.state.lidar_close = {"angles": check_angles_rad, "ranges": check_ranges_m}
+                    # The result of this loop are 2 sets of arrays where the values exclude non-conforming values.
+                    # The first set of arrays is indexed by a subset of angles that are nonzero in distance.
+                    # The second set of arrays is indexed by a subset of angles that are <= 1.0 meters in distance.
 
-                    if ranges_m and self.loop:
+                    # This is the dictionary that holds a set of arrays that are indexed by <= 1.0 meters in distance. 
+                    self.state.lidar_close = {"angles": angles_filled, "ranges": ranges_filled, "clusters":clusters} # Using angles filled
+
+                    if ranges_m and self.loop: # If ranges_m is not empty
                         # ---- broadcast attempt counter ----
                         with self._rate_lock:
                             self._tx_scans += 1
@@ -171,21 +212,21 @@ class LidarModule:
 
                         # Websocket broadcast
                         asyncio.run_coroutine_threadsafe(
-                            self.broadcast_scan(angles_rad, ranges_m, intensity),
+                            self.broadcast_scan(angles_filled, ranges_filled, intensity), # using angles_out for 
                             self.loop
                         )
 
                         # Update state with the lidar payload for the broadcaster
                         self.state.lidar_payload = {
                             "type": "scan",
-                            "angles": angles_rad,
+                            "angles": angles_rad, # using rad regular without any changes
                             "ranges": ranges_m,
                             "intensity": intensity,
                             "range_max": config.LIDAR_MAX_RANGE,
                         }
-
+                    #print(clusters)
                     # Print rates roughly once per second
-                    self._rate_tick()
+                    #self._rate_tick()
 
             except Exception as e:
                 print(f"[LIDAR] Error: {e}. Retrying in 5 seconds...")
