@@ -39,7 +39,7 @@ class MotorFunctions:
             "max_rad/s":            34.56,
             "real_max_rad/s":       34.56,
             "position_tolerance": 0.160,
-            "yaw_tolerance": 0.3,
+            "yaw_tolerance": 0.20,
         }
 
     def set_direction_pins(self, wheel, pinA, pinB, pwm):
@@ -236,12 +236,12 @@ class MotorFunctions:
         if dist >= self.mecanum_configuration["position_tolerance"]:
             # Scalar scaling -> Using desmos to see the curve at 3m we're operating 70 any close we're quickly going to 10%
             # Edit the curve below
-            scale = max(0.2, min(1.0,(1.0-math.exp(-.9 * dist)))) # Clamping just in case but it hsouldn't ever go above 1 anyway
+            scale = max(0.3, min(1.0,(1.0-math.exp(-.9 * dist)))) # Clamping just in case but it hsouldn't ever go above 1 anyway
             x_vector = np.cos(yaw1)*x_diff + np.sin(yaw1)*y_diff
             y_vector = -np.sin(yaw1)*x_diff + np.cos(yaw1)*y_diff
             dist = math.hypot(x_vector,y_vector)
-            x_vector = max(-1.0,min(1.0,(x_vector / dist) * scale))
-            y_vector = max(-1.0,min(1.0,(y_vector / dist) * scale))
+            x_vector = max(0.3,min(1.0,abs((x_vector / dist) * scale))) * np.sign(x_vector)
+            y_vector = max(0.3,min(1.0,abs((y_vector / dist) * scale))) * np.sign(y_vector)
         else:
             x_vector = 0.0
             y_vector = 0.0

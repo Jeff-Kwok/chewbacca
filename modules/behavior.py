@@ -53,7 +53,7 @@ class Manual(BehaviorBase):
         if abs(w) <= 0.1:
             w = 0 
             #print(f"stick{angle:.2f}")
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx*-1)
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx*-.65)
         #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
@@ -164,10 +164,10 @@ class Tag(BehaviorBase):
                 if move == True:
                     try:
                         # need to fix this for collision avoidance
-                        ctrl.state.command_vector["LX"] = y
+                        ctrl.state.command_vector["LX"] = y *-1
                         ctrl.state.command_vector["LY"] = x
                         print("Moving")
-                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(y*-1, x, yaw*-.25)
+                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"], ctrl.state.safe_axes["LY"], yaw*-.25)
                         ctrl.motors.drive_all_wheels({
                                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
                             })
@@ -180,7 +180,7 @@ class Tag(BehaviorBase):
                 return
     def checking_docking_pos(self,ctrl):
         # CHECK IF WE ALREADY ARE AT POSITION 0 WITHOUT MOVING
-        self.checking_position_move(ctrl,0,move=False,0.5)
+        self.checking_position_move(ctrl,0,move=False,performance_set=0.5)
         if self.performance_point == 0.5:
             self.docking_check_condition = False
         elif self.performance_point == 1:
@@ -312,8 +312,8 @@ class Tag(BehaviorBase):
                 self.last_autonomy_toggle = 1
                 print("Entering autonomy")
             else:   
-                print("Error switching states - you should always get an entering/exit message if not break loop")
-                break
+                #print("Error switching states - you should always get an entering/exit message if not break loop")
+                pass
             # Once autonomy is toggled -> we need to go into routine behavior
             submode = ctrl.state.tag_behavior_modes[ctrl.state.tag_behavior_current]
 
@@ -353,7 +353,7 @@ class Tag(BehaviorBase):
                 self.checking_docking_pos(ctrl) # WE CHECK IF WE ARE ALREADY AT DOCKING POSITION
                 if self.docking_check_condition == False:
                     try:
-                        self.checking_position_move(ctrl,0,move=True,0.5)
+                        self.checking_position_move(ctrl,0,move=True,performance_set=0.5)
                     except Exception as e:
                         self.behavior_roll(ctrl)
                         print(f"Error when docking: {e}")
@@ -394,7 +394,7 @@ class Tag(BehaviorBase):
                         print(f"[HUNT] Entered NOT docked: resume at index={self.explore_index}")
                 if len(self.explore_condition) != len(ctrl.state.tag_explore_sequence):
                     try:
-                        self.checking_position_move(ctrl,self.explore_index,move=True,0.5) # Move to current EXPLORE INDEX
+                        self.checking_position_move(ctrl,self.explore_index,move=True,performance_set=0.5) # Move to current EXPLORE INDEX
                         self._prev_submode = 3
                         if self.performance_point == 0: # If there is some error encountered we automatically go to lost
                             ctrl.state.tag_behavior_current = 2 
@@ -404,6 +404,8 @@ class Tag(BehaviorBase):
                                 self.explore_condition.append(ctrl.state.tag_explore_sequence[self.explore_index]) # Only increase the EXPLORE INDEX upon hitting a successful venture
                             self.explore_index = min(len(ctrl.state.tag_explore_sequence),(self.explore_index + 1)) # The explore index should always be the last goal set. It is only reset if we docked. Otherwise it will always try to finish the sequence.
                             print(self.explore_condition) # This should be the tags that we've passed by
+                            #ctrl.state.tag_behavior_current=4
+                            ## Opportunity to make it center the robot to the tag ->
                             return
                     except Exception as e:
                         print(f"Error: {e}")
@@ -438,4 +440,25 @@ class Tag(BehaviorBase):
                         ctrl.state.tag_behavior_current = 0
                         print("Couldn't make it back")
                 print("I'm lost!")
+'''
+            if submode == "Centering":
+                # It goes into centering mode when it correctly arrives at tags location -> tries to make sure the tag pose estimation and distance meets some threshhold
+                if self._prev_submode == 3:
+                    #x,angle= ctrl.state.tag_sequence.get("x"),ctrl.state.tag_sequence.get("angle")
+                    try:
+                        if ctrl.state.tag_sequence is not None and ctrl.state.tag_sequence.get("id") == ctrl.state.tag_explore_sequence[self.explore_index]:
+                            center = ctrl.state.tag_sequence.get("center") # -> Center x,y from left camera of whatever tag we see rn
+                            val = 160.0 - center[0]
+                            if val >= 10:
+                                ctrl.motors.drive_all_left(.35)
+                            elif val <= 10:
+                                ctrl.motors.drive_all_right(.35)
+                            print(center[0])
+                        else:
+                            pass
+                    except Exception as e:
+                        print(f"Error: {e}")
+                #self._prev_submode = 4
+                #ctrl.state.tag_behavior_current = 3
+'''
 

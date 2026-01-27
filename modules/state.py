@@ -15,7 +15,6 @@ class RobotState:
         # Initial yaw reading
         self.yaw = 0.0
 
-
         # Controller Inputs
         self.axes = {"LX": 0.0, "LY": 0.0, "RX": 0.0, "RY": 0.0}
         self.triggers = {"LT": 0.0, "RT": 0.0}
@@ -46,8 +45,6 @@ class RobotState:
         self.tag_discovered = {}
         # The list of phrases within the dictionary by order of append
         self.tag_explore_sequence = []
-
-
 
         # Lidar Zone
         self.zone = {"zone": "Far", "x_sum": 0.0, "y_sum": 0.0}

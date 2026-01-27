@@ -261,7 +261,7 @@ class CameraStereo:
                 if L["t"] is not None:
                     t = L["t"].reshape(-1)
                     angle = math.atan2(-float(t[0]), float(t[2]))
-
+                    #print(L["t"])
                 corners = L.get("corners")
                 return build_vision_payload(L["center"][0], L["center"][1], tag_id,t[2], angle, corners)
         return None

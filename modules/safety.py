@@ -21,6 +21,7 @@ class SafetyModule:
         angles_y = 0
         self.resultant_x = 0
         self.resultant_y = 0
+        avoidance_val = 25
         while True:
             # Receive Lidar data for the close zone
             # These are populated by LidarModule based on config.LIDAR_AVOID_DISTANCES["close"]
@@ -37,13 +38,14 @@ class SafetyModule:
                 lx = self.state.command_vector["LX"] * -1 # Orientation
                 ly = self.state.command_vector["LY"]
             elif self.state.robot_current == 3:
-                lx = self.state.command_vector["LX"] * -1 # Orientation
+                lx = self.state.command_vector["LX"] # Orientation
                 ly = self.state.command_vector["LY"]
+                avoidance_val = 45  
 
             # All points that are too close 
             too_close = np.asarray(close_ranges,dtype=float) <= 1.2
-            avoidance_arc = np.deg2rad(25)
             controller_angle = round((np.arctan2(ly, lx)),3) % (2*np.pi)
+            avoidance_arc = np.deg2rad(avoidance_val)
 
             angles_x = np.cos(controller_angle)
             angles_y = np.sin(controller_angle)
@@ -54,7 +56,7 @@ class SafetyModule:
             count = int(np.sum(mask))
 
             if count > 0:
-                scale = 2.0/count
+                scale = 1.5/count
                 rep_x = np.sum(np.cos(close_angles[mask])) * scale
                 rep_y = np.sum(np.sin(close_angles[mask])) * scale
                 angles_x -= rep_x

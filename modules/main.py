@@ -53,11 +53,13 @@ async def camera_loop(state: RobotState):
                 tag_id = payload.get("id")
                 x = payload.get("z")
                 angle = payload.get("angle")
+                center = payload.get("center")
                 if tag_id is not None:
                     state.tag_sequence = {
                         "id": tag_id,
                         "x": x,
                         "angle": angle,
+                        "center":center,
                     }
                 else:
                     state.tag_sequence = None
