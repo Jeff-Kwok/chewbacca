@@ -88,22 +88,19 @@ class LidarModule:
     def angle_diff(self, a, b):
         """Wrap-safe signed difference a-b in radians, in [-pi, pi]."""
         return (a - b + math.pi) % (2.0 * math.pi) - math.pi
-
     def fill_angle_gaps(self, angles_rad, ranges_m,
                         angle_step_deg=0.5,
                         max_fill_gap_deg=10.0,
                         dist_gap_m=0.5):
         """
-        Insert artificial points between consecutive (angle,range) samples
-        when:
-          - angular gap is > angle_step and <= max_fill_gap
-          - range change is small (|dr| < dist_gap_m)
-        Returns (filled_angles, filled_ranges).
+        Returns:
+        filled_a, filled_r: with inserted points for moderate gaps (same as before)
+        clusters: stitched segments as endpoints only: [[[a_end,a_start],[r_end,r_start]], ...]
         """
+
         if not angles_rad or len(angles_rad) != len(ranges_m) or len(angles_rad) < 2:
             return angles_rad, ranges_m, []
 
-        # Ensure monotonic ordering by angle (helps segmentation/filling)
         order = np.argsort(np.asarray(angles_rad))
         a = np.asarray(angles_rad, dtype=float)[order]
         r = np.asarray(ranges_m, dtype=float)[order]
@@ -113,19 +110,37 @@ class LidarModule:
 
         filled_a = [float(a[0])]
         filled_r = [float(r[0])]
-        clusters = []
-        for i in range(1, len(a)):
-            a0, r0 = filled_a[-1], filled_r[-1]
-            a1, r1 = float(a[i]), float(r[i])
 
-            da = self.angle_diff(a1, a0)   # signed shortest path
+        clusters = []
+
+        # ---- stitched-run state (endpoints only) ----
+        run_active = False
+        run_a_start = float(a[0])
+        run_r_start = float(r[0])
+        run_a_end   = float(a[0])
+        run_r_end   = float(r[0])
+        # -------------------------------------------
+
+        def finalize_run():
+            nonlocal run_active, run_a_start, run_r_start, run_a_end, run_r_end
+            if run_active:
+                # store as [[a_end,a_start],[r_end,r_start]]
+                clusters.append([[run_a_end, run_a_start], [run_r_end, run_r_start]])
+            run_active = False
+
+        for i in range(1, len(a)):
+            a0, r0 = float(a[i-1]), float(r[i-1])
+            a1, r1 = float(a[i]),   float(r[i])
+
+            da = self.angle_diff(a1, a0)
             abs_da = abs(da)
             dr = r1 - r0
 
-            # Fill only for moderate gaps + similar distance
+            stitchable = (abs_da <= max_fill_gap) and (abs(dr) < dist_gap_m)
+
+            # We still fill if the gap is > step but not huge and ranges match
             if abs_da > angle_step and abs_da <= max_fill_gap and abs(dr) < dist_gap_m:
-                clusters.append([[a1,a0],[r1,r0]])
-                n = int(abs_da // angle_step)  # interior points count
+                n = int(abs_da // angle_step)
                 for k in range(1, n + 1):
                     t = k / (n + 1)
                     aa = a0 + da * t
@@ -133,10 +148,31 @@ class LidarModule:
                     filled_a.append(float(aa))
                     filled_r.append(float(rr))
 
+            # Always append the real sample
             filled_a.append(a1)
             filled_r.append(r1)
+
+            # ---- run stitching logic ----
+            if stitchable:
+                if not run_active:
+                    # start a new run at the previous point
+                    run_active = True
+                    run_a_start = a0
+                    run_r_start = r0
+                # extend run to current point
+                run_a_end = a1
+                run_r_end = r1
+            else:
+                # continuity broke -> finalize any existing run
+                finalize_run()
+                # You may also want to start "single point" runs (usually no)
+                # run_active stays False
+            # -----------------------------
+
+        finalize_run()
         return filled_a, filled_r, clusters
-    # ----------------------------------------------------
+
+        # ----------------------------------------------------
 
     def lidar_loop(self):
         while not self.stop_event.is_set():

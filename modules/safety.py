@@ -10,14 +10,14 @@ class SafetyModule:
         self.look_distance = 5.0
 
         self.fov_rad = np.deg2rad(90)
-        self.classify_thresh = 0.2
+        self.classify_thresh = 0.08
         self.classify_min_points = 5
 
         # websocket
         self.ws_port = ws_port
         self.clients = set()
 
-    # ----------------- WS helpers -----------------
+    # ----------------- WS helpers -----------------  
     async def ws_handler(self, websocket):
         self.clients.add(websocket)
         try:
@@ -51,26 +51,60 @@ class SafetyModule:
             return a0 <= theta <= a1
         else:
             return theta >= a0 or theta <= a1
-
+    def polar_point_distance(self,a1, r1, a2, r2):
+        dtheta = self.angle_diff(a2, a1)
+        return np.sqrt(r1*r1 + r2*r2 - 2*r1*r2*np.cos(dtheta))
     # ----------------- Payload builders -----------------
-    def rectangular_payload(self, payload, cluster):
+    def rectangular_payload(self, cluster, out_thickness, in_thickness, a_lo, r_lo, m):
+        """
+        Build a polar "thick band" around the fitted line between a0 and a1.
+
+        cluster: [[a1,a0],[r1,r0]] (endpoints only define angular span)
+        out_thickness: >=0 (farther than line)
+        in_thickness:  >=0 (closer than line)
+        a_lo, r_lo, m: fitted line baseline: r_hat(a) = r_lo + m*angle_diff(a, a_lo)
+        returns 4 corners (a,r) in order.
+        """
         a1, a0 = float(cluster[0][0]), float(cluster[0][1])
-        r1, r0 = float(cluster[1][0]), float(cluster[1][1])
-        a_pos, r_pos, a_neg, r_neg = map(float, payload)
 
-        def closest_extreme_to(a_end):
-            d_pos = abs(self.angle_diff(a_pos, a_end))
-            d_neg = abs(self.angle_diff(a_neg, a_end))
-            return r_pos if d_pos <= d_neg else r_neg
+        # Ensure consistent direction from a0 -> a1 along shortest arc
+        da01 = self.angle_diff(a1, a0)
+        if da01 < 0:
+            # swap to make forward progress positive
+            a0, a1 = a1, a0
 
-        r_far0 = max(closest_extreme_to(a0), r0)
-        r_far1 = max(closest_extreme_to(a1), r1)
+        # Baseline ranges from fitted line at each endpoint angle
+        t0 = self.angle_diff(a0, a_lo)
+        t1 = self.angle_diff(a1, a_lo)
+        r_base0 = float(r_lo + m * t0)
+        r_base1 = float(r_lo + m * t1)
 
-        return [(a0, r0), (a0, r_far0), (a1, r_far1), (a1, r1)]
+        # Apply thickness around the baseline (this is the key)
+        r_near0 = max(0.0, r_base0 - in_thickness)
+        r_near1 = max(0.0, r_base1 - in_thickness)
+        r_far0  = r_base0 + out_thickness
+        r_far1  = r_base1 + out_thickness
+
+        # Guard against inversion
+        if r_near0 > r_far0:
+            r_near0, r_far0 = r_far0, r_near0
+        if r_near1 > r_far1:
+            r_near1, r_far1 = r_far1, r_near1
+
+        return [
+            (a0, r_near0),
+            (a0, r_far0),
+            (a1, r_far1),
+            (a1, r_near1),
+        ]
+
+
 
     def line_payload(self, cluster):
         return [float(cluster[0][0]), float(cluster[1][0])], [float(cluster[0][1]), float(cluster[1][1])]
 
+    def polar_to_xy(self, a, r):
+        return np.array([r * np.cos(a), r * np.sin(a)], dtype=float)
     def circular_payload(self, cluster):
         a1, a0 = float(cluster[0][0]), float(cluster[0][1])
         r1, r0 = float(cluster[1][0]), float(cluster[1][1])
@@ -79,6 +113,61 @@ class SafetyModule:
         mid_angle = (a0 + 0.5 * da) % (2 * np.pi)
         mid_dist = 0.5 * (r0 + r1)
         return [float(mid_angle), float(mid_dist)]
+
+    def rect_xy_from_polar_cluster_bestfit(self,a_seg, r_seg):
+        """
+        Build a true XY rectangle (parallel edges) containing all points in a cluster,
+        using a best-fit line (total least squares via PCA).
+
+        Inputs:
+        a_seg: 1D array-like of angles (rad)
+        r_seg: 1D array-like of ranges (m)
+
+        Output:
+        rect_xy: list of 4 corners [[x,y], ...] in meters (CCW order),
+                or None if not enough points.
+        """
+        a_seg = np.asarray(a_seg, dtype=float)
+        r_seg = np.asarray(r_seg, dtype=float)
+        if a_seg.size < 2 or r_seg.size < 2:
+            return None
+
+        # Convert polar -> XY
+        x = r_seg * np.cos(a_seg)
+        y = r_seg * np.sin(a_seg)
+        pts = np.column_stack((x, y))  # (N,2)
+
+        # Mean center
+        mu = pts.mean(axis=0)
+        X = pts - mu
+
+        # PCA (total least squares line of best fit):
+        # principal eigenvector of covariance gives direction of best-fit line
+        C = (X.T @ X) / max(1, X.shape[0])
+        w, V = np.linalg.eigh(C)                 # eigenvalues asc
+        v = V[:, np.argmax(w)]                  # direction along the line
+        v = v / (np.linalg.norm(v) + 1e-12)     # unit
+        n = np.array([-v[1], v[0]], dtype=float)  # unit normal
+
+        # Project points onto v and n to get extents
+        s = X @ v   # along-line coordinates
+        d = X @ n   # normal coordinates
+
+        s_min, s_max = float(s.min()), float(s.max())
+        d_min, d_max = float(d.min()), float(d.max())
+
+        # Endpoints of the baseline segment along v through mu
+        b0 = mu + v * s_min
+        b1 = mu + v * s_max
+
+        # Rectangle corners (CCW)
+        c0 = b0 + n * d_max
+        c1 = b1 + n * d_max
+        c2 = b1 + n * d_min
+        c3 = b0 + n * d_min
+
+        return [c0.tolist(), c1.tolist(), c2.tolist(), c3.tolist()]
+
 
     # ----------------- Classification -----------------
     def classify_cluster(self, cluster, angles, ranges, thresh=0.2, min_points=5):
@@ -92,8 +181,13 @@ class SafetyModule:
         a_seg = angles[in_window]
         r_seg = ranges[in_window]
 
+        # guard: no points
+        if a_seg.size == 0:
+            return {"label": "degenerate", "n": 0}
+
+        # too few points => treat as circle-ish
         if a_seg.size < min_points:
-            return {"label": "Circle", "n": int(a_seg.size), "circle": self.circular_payload(cluster)}
+            return {"label": "circle", "n": int(a_seg.size), "circle": self.circular_payload(cluster)}
 
         da = self.angle_diff(a_hi, a_lo)
         if abs(da) < 1e-6:
@@ -113,25 +207,31 @@ class SafetyModule:
         has_neg = max_neg < -thresh
 
         if has_pos or has_neg:
-            payload = [float(a_seg[i_pos]), float(r_seg[i_pos]),
-                       float(a_seg[i_neg]), float(r_seg[i_neg])]
-            corners = self.rectangular_payload(payload, cluster)
+            rect_xy = self.rect_xy_from_polar_cluster_bestfit(a_seg, r_seg)
+            return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size)}
+
+        # else line-ish: measure endpoint separation in meters (true Euclidean)
+        p1, p2 = self.line_payload(cluster)   # [a,r], [a,r]
+        abs_distance = float(self.polar_point_distance(p1[0], p1[1], p2[0], p2[1]))
+
+        if abs_distance > 0.45:
             return {
-                "label": "rectangle_like",
+                "label": "line",
                 "n": int(a_seg.size),
-                "max_pos": max_pos,
-                "max_neg": max_neg,
-                "payload": payload,
-                "corners": corners,
+                "max_abs": float(np.max(np.abs(resid))),
+                "line": [p1, p2],   # [[a,r],[a,r]]
+                "length": abs_distance,
             }
 
-        p1, p2 = self.line_payload(cluster)
+        # short segment => treat as circle-ish
         return {
-            "label": "line_like",
+            "label": "circle",
             "n": int(a_seg.size),
             "max_abs": float(np.max(np.abs(resid))),
-            "line": (p1, p2),
+            "circle": self.circular_payload(cluster),  # [a,r]
+            "length": abs_distance,
         }
+
 
     # ----------------- Main loop -----------------
     async def run(self):
@@ -211,7 +311,7 @@ class SafetyModule:
                 }
 
                 self.state.safety = safety_payload
-                print(self.state.safety)
+                #print(self.state.safety)
                 await self.broadcast_safety(safety_payload)
 
                 await asyncio.sleep(0.05)  # ~20 Hz
