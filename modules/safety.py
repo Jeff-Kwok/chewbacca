@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
 import asyncio
-import numpy as np
-import math
 import json
+import math
+import numpy as np
 import websockets
 
 
@@ -23,37 +24,40 @@ class SafetyModule:
        - keep only clusters within intended_look
        - classify each into: rectangle / line / circle and attach geometry payloads
 
-    4) Compute avoidance output vector:
-       - pick the "first obstacle hit" (minimum positive projection along intended direction)
-       - compute how close it is to the intended infinite line (perp distance)
-       - compute a side-step magnitude based on danger and how soon you hit it
-       - CHOOSE LEFT vs RIGHT by "free-space scoring" (try both sides, pick larger clearance cone)
-       - output avoid_vector = forward_keep*intended + mag_side*(normal)
+    4) For each hit: compute the closest point ON THE GEOMETRY to:
+       - (A) the intended ray (so we don't pick the far edge when ray goes through a rectangle)
+       - (B) and also record closest-to-robot if you want it
+       In practice we choose the point with MIN along-distance on the ray that intersects geometry.
+       If ray doesn’t intersect geometry, fallback to closest-to-ray distance.
 
-    5) Broadcast everything over WS:
-       - intended_vector, intended_hits, avoid_vector, chosen_obstacle debug
+    5) Build an ORTHOGONAL line through the chosen closest point and pick midpoint of largest
+       free-space interval along that orthogonal line, using intervals blocked by rectangles/circles/lines.
+
+    6) Broadcast everything over WS:
+       - intended_vector, intended_hits (with info.fit + closest + free_space)
     """
 
     def __init__(self, state, ws_port=8766):
         self.state = state
 
         # --- How far ahead the look-ahead ray extends when stick magnitude is 1.0 ---
-        self.look_distance = 5.0
+        self.look_distance = 2.5
 
         # --- Cluster classification parameters ---
-        self.classify_thresh = 0.3
-        self.classify_min_points = 5
+        self.classify_thresh = 0.12
+        self.classify_min_distance = 0.2
 
-        # --- Avoidance tuning ---
-        self.safety_radius = 0.35     # desired clearance from intended line (m)
-        self.side_gain = 1.3          # how hard to sidestep
-        self.forward_keep = 1.0       # keep forward component
-        self.inflate_rect = 0.03      # inflate rectangle thickness slightly (m)
+        # --- Rectangle inflation (classification geometry) ---
+        self.inflate_rect = 0.05
 
-        # --- Free-space side choice tuning ---
-        self.cone_half_angle = np.deg2rad(12.0)  # +/-12° cone for clearance scoring
-        self.side_test_k = 0.8                   # how sideways the test direction is
-        self.side_tie_eps = 0.15                 # if clearances too close, fall back to geometric side
+        # ---- Fit/residual visualization ----
+        self.max_fit_points = 120
+
+        # ---- Closest-point / free-space parameters ----
+        self.closest_inflate = 0.06     # inflate obstacles when computing intersections/intervals
+        self.free_span_deg = 60.0       # conceptually, but we use a true XY orthogonal line
+        self.free_max_step = 2.0        # meters left/right on orthogonal line to search
+        self.circle_radius_est = 0.24   # meters (approx obstacle thickness for "circle-ish" clusters)
 
         # websocket
         self.ws_port = ws_port
@@ -86,23 +90,22 @@ class SafetyModule:
         """Shortest signed difference a-b in [-pi, pi)."""
         return self.angle_wrap(a - b)
 
-    def angle_in_interval(self, theta: float, a0: float, a1: float) -> bool:
-        """
-        True if theta is in [a0,a1] with wraparound support.
-        """
+    def angle_in_interval(self, theta: float, a0: float, a1: float, padding: float) -> bool:
+        """True if theta is in [a0,a1] with wraparound support."""
         theta = self.angle_wrap(theta)
+        padding = np.deg2rad(padding)
         a0 = self.angle_wrap(a0)
         a1 = self.angle_wrap(a1)
-        if a0 <= a1:
-            return a0 <= theta <= a1
-        return theta >= a0 or theta <= a1
+        obstacle_arc = (a1 - a0) % (2*np.pi)
+        intended_arc = (theta - a0) % (2*np.pi)
+        return intended_arc <= (obstacle_arc + padding) or intended_arc >= (2*np.pi - padding)
 
-    # ----------------- Basic geometry helpers (no external dependencies) -----------------
+    # ----------------- Basic geometry helpers -----------------
     def _unit(self, v):
         n = float(np.linalg.norm(v))
-        if n < 1e-9:
+        if n < 1e-12:
             return np.array([0.0, 0.0], dtype=float)
-        return v / n
+        return np.asarray(v, dtype=float) / n
 
     def _ray_dir(self, theta):
         return np.array([math.cos(theta), math.sin(theta)], dtype=float)
@@ -110,29 +113,28 @@ class SafetyModule:
     def _cross2(self, a, b):
         return float(a[0] * b[1] - a[1] * b[0])
 
-    def _signed_dist_to_intended_line(self, p_xy, u_hat):
-        """
-        Signed perpendicular distance from point p to the infinite line through origin along u_hat.
-        Positive => point is to the "left" of u_hat (right-hand rule).
-        """
+    def _along(self, p_xy, u_hat):
+        return float(np.dot(p_xy, u_hat))
+
+    def _signed_dist_to_line_through_origin(self, p_xy, u_hat):
+        """Signed perpendicular distance to line through origin along u_hat."""
         return self._cross2(u_hat, p_xy)
 
-    def _along_intended(self, p_xy, u_hat):
-        """Projection distance along intended direction."""
-        return float(np.dot(p_xy, u_hat))
+    def _xy_to_polar(self, p_xy):
+        x, y = float(p_xy[0]), float(p_xy[1])
+        a = (math.atan2(y, x)) % (2 * math.pi)
+        r = math.hypot(x, y)
+        return a, r
 
     # ----------------- Polar utilities -----------------
     def polar_point_distance(self, a1, r1, a2, r2):
-        """True euclidean distance between two polar points."""
         dtheta = self.angle_diff(a2, a1)
-        return np.sqrt(r1 * r1 + r2 * r2 - 2 * r1 * r2 * np.cos(dtheta))
+        return math.sqrt(r1 * r1 + r2 * r2 - 2 * r1 * r2 * math.cos(dtheta))
 
     def line_payload(self, cluster):
-        """cluster: [[a1,a0],[r1,r0]] -> returns endpoints [a,r], [a,r]."""
         return [float(cluster[0][0]), float(cluster[1][0])], [float(cluster[0][1]), float(cluster[1][1])]
 
     def circular_payload(self, cluster):
-        """Simple circle-ish representation: midpoint (a,r)."""
         a1, a0 = float(cluster[0][0]), float(cluster[0][1])
         r1, r0 = float(cluster[1][0]), float(cluster[1][1])
         da = self.angle_diff(a1, a0)
@@ -142,22 +144,15 @@ class SafetyModule:
 
     # ----------------- Rectangle from best-fit (PCA TLS) -----------------
     def rect_xy_from_polar_cluster_bestfit(self, a_seg, r_seg):
-        """
-        Build a true XY rectangle (parallel edges) containing all points in a cluster,
-        using a best-fit line (total least squares via PCA).
-        Output is rect_xy = [[x,y], ...] in meters.
-        """
         a_seg = np.asarray(a_seg, dtype=float)
         r_seg = np.asarray(r_seg, dtype=float)
         if a_seg.size < 2 or r_seg.size < 2:
             return None
 
-        # Convert polar -> XY points
         x = r_seg * np.cos(a_seg)
         y = r_seg * np.sin(a_seg)
-        pts = np.column_stack((x, y))  # (N,2)
+        pts = np.column_stack((x, y))
 
-        # Mean center + PCA direction
         mu = pts.mean(axis=0)
         X = pts - mu
 
@@ -167,13 +162,11 @@ class SafetyModule:
         v = v / (np.linalg.norm(v) + 1e-12)
         n = np.array([-v[1], v[0]], dtype=float)
 
-        # Extents
         s = X @ v
         d = X @ n
         s_min, s_max = float(s.min()), float(s.max())
         d_min, d_max = float(d.min()), float(d.max())
 
-        # inflate to contain points robustly
         d_min -= self.inflate_rect
         d_max += self.inflate_rect
 
@@ -187,13 +180,21 @@ class SafetyModule:
 
         return [c0.tolist(), c1.tolist(), c2.tolist(), c3.tolist()]
 
+    # ----------------- Fit debug downsampling -----------------
+    def _downsample(self, arr, max_n):
+        arr = np.asarray(arr)
+        if arr.size <= max_n:
+            return arr
+        step = max(1, int(arr.size // max_n))
+        return arr[::step]
+
     # ----------------- Cluster classification -----------------
     def classify_cluster(self, cluster, angles, ranges):
         """
         Returns dict like:
-          {"label":"rectangle","rect_xy":[...]}
-          {"label":"line","line":[[a,r],[a,r]]}
-          {"label":"circle","circle":[a,r]}
+          {"label":"rectangle","rect_xy":[...], "fit": {...}}
+          {"label":"line","line":[[a,r],[a,r]], "fit": {...}}
+          {"label":"circle","circle":[a,r], "fit": {...}}
         """
         a_hi, a_lo = float(cluster[0][0]), float(cluster[0][1])
         r_hi, r_lo = float(cluster[1][0]), float(cluster[1][1])
@@ -201,362 +202,546 @@ class SafetyModule:
         angles = np.asarray(angles, dtype=float)
         ranges = np.asarray(ranges, dtype=float)
 
-        # Wrap-safe window selection
-        in_window = np.array([self.angle_in_interval(a, a_lo, a_hi) for a in angles], dtype=bool)
+        in_window = np.array([self.angle_in_interval(a, a_lo, a_hi, padding=0) for a in angles], dtype=bool)
         a_seg = angles[in_window]
         r_seg = ranges[in_window]
 
-        # guard: no points
-        if a_seg.size == 0:
-            return {"label": "degenerate", "n": 0}
+        da = float(self.angle_diff(a_hi, a_lo))
+        if (a_seg.size <= 5) or (abs(da) < 1e-3):
+            return {"label": "degenerate", "n": int(a_seg.size), "reason": "no_points_or_da"}
 
-        # too few points => circle-ish
-        if a_seg.size < self.classify_min_points:
-            return {"label": "circle", "n": int(a_seg.size), "circle": self.circular_payload(cluster)}
+        if not np.any(r_seg <= self.look_distance):
+            return {"label": "degenerate", "n": int(a_seg.size), "reason": "out_of_range"}
 
-        # fit a simple line in (theta,r) to estimate residual band
-        da = self.angle_diff(a_hi, a_lo)
-        if abs(da) < 1e-6:
-            return {"label": "degenerate", "n": int(a_seg.size)}
+        try:
+            x = np.array([self.angle_diff(a, a_lo) for a in a_seg], dtype=float)
+            slope = (r_hi - r_lo) / da
+            r_hat = r_lo + slope * x
+            resid = r_seg - r_hat
+        except Exception:
+            return {"label": "degenerate", "n": int(a_seg.size), "reason": "fit_failed"}
 
-        t = np.array([self.angle_diff(a, a_lo) for a in a_seg], dtype=float)
-        m = (r_hi - r_lo) / da
-        r_hat = r_lo + m * t
-        resid = r_seg - r_hat
+        fit_dbg = {
+            "a_lo": float(a_lo), "a_hi": float(a_hi),
+            "r_lo": float(r_lo), "r_hi": float(r_hi),
+            "da": float(da),
+            "a_seg": self._downsample(a_seg, self.max_fit_points).tolist(),
+            "r_seg": self._downsample(r_seg, self.max_fit_points).tolist(),
+            "x": self._downsample(x, self.max_fit_points).tolist(),
+            "r_hat": self._downsample(r_hat, self.max_fit_points).tolist(),
+            "resid": self._downsample(resid, self.max_fit_points).tolist(),
+            "resid_max": float(np.max(resid)),
+            "resid_min": float(np.min(resid)),
+        }
 
         max_pos = float(np.max(resid))
         max_neg = float(np.min(resid))
 
-        # rectangle-ish if total thickness is large
-        if (max_pos + abs(max_neg)) > self.classify_thresh:
-            rect_xy = self.rect_xy_from_polar_cluster_bestfit(a_seg, r_seg)
-            return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size)}
-
-        # otherwise line-ish: check endpoint separation
         p1, p2 = self.line_payload(cluster)
         length = float(self.polar_point_distance(p1[0], p1[1], p2[0], p2[1]))
-        if length > 0.45:
-            return {"label": "line", "line": [p1, p2], "length": length, "n": int(a_seg.size)}
 
-        # short => circle-ish
-        return {"label": "circle", "circle": self.circular_payload(cluster), "length": length, "n": int(a_seg.size)}
+        # Rectangle if thick + long enough
+        if (max_pos + abs(max_neg)) > self.classify_thresh and length >= self.classify_min_distance:
+            rect_xy = self.rect_xy_from_polar_cluster_bestfit(a_seg, r_seg)
+            return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size), "fit": fit_dbg}
 
-    # ----------------- Free-space scoring for left vs right -----------------
-    def _cone_clearance(self, angles, ranges, theta, cone_half_angle, max_r=6.0):
+        # Line if long enough
+        if length >= self.classify_min_distance:
+            return {"label": "line", "line": [p1, p2], "length": length, "n": int(a_seg.size), "fit": fit_dbg}
+
+        # Otherwise circle-ish
+        return {"label": "circle", "circle": self.circular_payload(cluster), "n": int(a_seg.size), "fit": fit_dbg}
+
+    # ============================================================
+    #  Closest point ON geometry to the intended RAY
+    # ============================================================
+    def _ray_segment_intersection(self, u_hat, a_xy, b_xy):
         """
-        Clearance score for steering direction theta.
-        Larger is better. Uses 10th percentile range inside cone.
+        Ray from origin: p(t)=t*u_hat, t>=0
+        Segment: a + s*(b-a), s in [0,1]
+        Return smallest positive t if intersects, else None.
         """
-        if angles.size == 0:
-            return max_r
+        u = np.asarray(u_hat, float)
+        a = np.asarray(a_xy, float)
+        b = np.asarray(b_xy, float)
+        v = b - a
 
-        # wrap-safe angular distance
-        d = np.array([abs(self.angle_diff(a, theta)) for a in angles], dtype=float)
-        mask = d <= cone_half_angle
-        if not np.any(mask):
-            return max_r
-
-        r = np.asarray(ranges, dtype=float)[mask]
-        r = r[np.isfinite(r)]
-        if r.size == 0:
-            return max_r
-
-        r = r[(r > 0.02) & (r <= max_r)]
-        if r.size == 0:
-            return max_r
-
-        return float(np.percentile(r, 10))
-
-    def _pick_side_by_free_space(self, angles, ranges, intended_theta, n_left, k):
-        """
-        Try both candidate directions (left/right) and choose side with more clearance.
-        Returns side_sign (+1=left, -1=right) and debug dict.
-        """
-        u = self._unit(self._ray_dir(float(intended_theta)))
-
-        wL = self._unit(u + k * n_left)
-        wR = self._unit(u - k * n_left)
-
-        thetaL = math.atan2(wL[1], wL[0]) % (2 * np.pi)
-        thetaR = math.atan2(wR[1], wR[0]) % (2 * np.pi)
-
-        cL = self._cone_clearance(angles, ranges, thetaL, self.cone_half_angle, max_r=6.0)
-        cR = self._cone_clearance(angles, ranges, thetaR, self.cone_half_angle, max_r=6.0)
-
-        side_sign = +1.0 if cL >= cR else -1.0
-        dbg = {"thetaL": thetaL, "thetaR": thetaR, "clearL": cL, "clearR": cR}
-        return side_sign, dbg
-
-    # ----------------- Representative obstacle points for "first hit" -----------------
-    def _obstacle_points_xy(self, info):
-        """
-        Return representative points in XY for:
-          rectangle -> corners
-          line      -> endpoints
-          circle    -> center point
-        """
-        if not info:
+        denom = self._cross2(u, v)
+        if abs(denom) < 1e-12:
             return None
 
-        if info.get("rect_xy"):
-            pts = np.asarray(info["rect_xy"], dtype=float)
-            if pts.ndim == 2 and pts.shape[1] == 2 and pts.shape[0] >= 3:
-                return pts
+        # Solve t*u = a + s*v
+        t = self._cross2(a, v) / denom
+        s = self._cross2(a, u) / denom
+        if t >= 0.0 and 0.0 <= s <= 1.0:
+            return float(t)
+        return None
 
-        if info.get("line"):
+    def _closest_point_on_segment_to_ray(self, u_hat, a_xy, b_xy):
+        """
+        Fallback: choose point on segment minimizing distance to ray (line through origin along u_hat),
+        but preferring points in front (t>=0).
+        Returns dict with closest point and (t, abs_dist).
+        """
+        u = self._unit(u_hat)
+        a = np.asarray(a_xy, float)
+        b = np.asarray(b_xy, float)
+        v = b - a
+        vv = float(np.dot(v, v))
+        if vv < 1e-12:
+            p = a
+            t = self._along(p, u)
+            absd = abs(self._signed_dist_to_line_through_origin(p, u))
+            return {"p": p, "t": float(t), "absd": float(absd)}
+
+        # sample endpoints + projection of origin-line onto segment via minimal approach (cheap)
+        candidates = [a, b]
+
+        # add point on segment closest to the infinite line through origin in direction u
+        # approximate by minimizing |cross(u, a + s v)| (2D). Do a small analytic solve:
+        # cross(u, a + s v) = cross(u,a) + s*cross(u,v)
+        cu_a = self._cross2(u, a)
+        cu_v = self._cross2(u, v)
+        if abs(cu_v) > 1e-12:
+            s0 = -cu_a / cu_v
+            s0 = max(0.0, min(1.0, float(s0)))
+            candidates.append(a + s0 * v)
+
+        best = None
+        for p in candidates:
+            t = self._along(p, u)
+            if t < 0.0:
+                continue
+            absd = abs(self._signed_dist_to_line_through_origin(p, u))
+            if best is None or absd < best["absd"] or (abs(absd - best["absd"]) < 1e-6 and t < best["t"]):
+                best = {"p": p, "t": float(t), "absd": float(absd)}
+        if best is None:
+            # everything behind -> pick endpoint with largest t (least behind) for stability
+            p = a if self._along(a, u) > self._along(b, u) else b
+            t = self._along(p, u)
+            absd = abs(self._signed_dist_to_line_through_origin(p, u))
+            return {"p": p, "t": float(t), "absd": float(absd)}
+        return best
+
+    def closest_point_to_intended_ray(self, info, intended_angle):
+        """
+        Returns:
+          {
+            "closest_point_xy":[x,y],
+            "closest_point_polar":[a,r],
+            "t_hit": t,           # along intended ray (>=0) if meaningful
+            "abs_dist": d         # perp dist to ray line (for fallback)
+          }
+        Priority:
+          1) If ray intersects geometry => choose smallest t intersection (closest edge facing robot)
+          2) else fallback to closest-to-ray distance
+        """
+        u = self._unit(self._ray_dir(float(intended_angle)))
+        lab = info.get("label", "")
+
+        # ---- rectangle: intersect ray with polygon edges, take smallest t ----
+        if lab == "rectangle" and info.get("rect_xy"):
+            pts = np.asarray(info["rect_xy"], float)
+            best_t = None
+            for i in range(len(pts)):
+                a = pts[i]
+                b = pts[(i + 1) % len(pts)]
+                t = self._ray_segment_intersection(u, a, b)
+                if t is not None and (best_t is None or t < best_t):
+                    best_t = t
+            if best_t is not None:
+                p = best_t * u
+                a_p, r_p = self._xy_to_polar(p)
+                return {
+                    "closest_point_xy": [float(p[0]), float(p[1])],
+                    "closest_point_polar": [float(a_p), float(r_p)],
+                    "t_hit": float(best_t),
+                    "abs_dist": 0.0
+                }
+
+            # fallback: choose closest point on rectangle edges to ray
+            best = None
+            for i in range(len(pts)):
+                a = pts[i]
+                b = pts[(i + 1) % len(pts)]
+                cand = self._closest_point_on_segment_to_ray(u, a, b)
+                if best is None or cand["absd"] < best["absd"] or (abs(cand["absd"] - best["absd"]) < 1e-6 and cand["t"] < best["t"]):
+                    best = cand
+            p = best["p"]
+            a_p, r_p = self._xy_to_polar(p)
+            return {
+                "closest_point_xy": [float(p[0]), float(p[1])],
+                "closest_point_polar": [float(a_p), float(r_p)],
+                "t_hit": float(best["t"]),
+                "abs_dist": float(best["absd"])
+            }
+
+        # ---- circle-ish: intersect ray with disk around center ----
+        if lab == "circle" and info.get("circle"):
+            a_c, r_c = float(info["circle"][0]), float(info["circle"][1])
+            c = np.array([r_c * math.cos(a_c), r_c * math.sin(a_c)], dtype=float)
+            rad = float(info.get("radius_est", self.circle_radius_est)) + float(self.closest_inflate)
+
+            # Solve |t*u - c|^2 = rad^2
+            # t^2 - 2 t (u·c) + |c|^2 - r^2 = 0
+            uc = float(np.dot(u, c))
+            cc = float(np.dot(c, c))
+            disc = uc*uc - (cc - rad*rad)
+            if disc >= 0.0:
+                sdisc = math.sqrt(max(0.0, disc))
+                t1 = uc - sdisc
+                t2 = uc + sdisc
+                # smallest positive t
+                t_candidates = [t for t in [t1, t2] if t >= 0.0]
+                if t_candidates:
+                    t = min(t_candidates)
+                    p = t * u
+                    a_p, r_p = self._xy_to_polar(p)
+                    return {
+                        "closest_point_xy": [float(p[0]), float(p[1])],
+                        "closest_point_polar": [float(a_p), float(r_p)],
+                        "t_hit": float(t),
+                        "abs_dist": 0.0
+                    }
+
+            # fallback: closest point on circle to ray direction line
+            # project center onto ray: t0=uc (can be negative)
+            t0 = max(0.0, uc)
+            p0 = t0 * u
+            v = c - p0
+            nv = float(np.linalg.norm(v))
+            if nv < 1e-9:
+                # ray goes through center; closest is at t0 - rad (front)
+                t = max(0.0, t0 - rad)
+                p = t * u
+            else:
+                # move from center toward ray by radius
+                p = c - (rad / nv) * v
+                # ensure in front
+                if float(np.dot(p, u)) < 0.0:
+                    p = c + (rad / nv) * v
+            a_p, r_p = self._xy_to_polar(p)
+            t = float(np.dot(p, u))
+            d = abs(self._signed_dist_to_line_through_origin(p, u))
+            return {
+                "closest_point_xy": [float(p[0]), float(p[1])],
+                "closest_point_polar": [float(a_p), float(r_p)],
+                "t_hit": float(t),
+                "abs_dist": float(d)
+            }
+
+        # ---- line segment obstacle: just treat as segment ----
+        if lab == "line" and info.get("line"):
             p1, p2 = info["line"][0], info["line"][1]
-            return np.array([
-                [float(p1[1]) * math.cos(float(p1[0])), float(p1[1]) * math.sin(float(p1[0]))],
-                [float(p2[1]) * math.cos(float(p2[0])), float(p2[1]) * math.sin(float(p2[0]))],
-            ], dtype=float)
+            a_xy = np.array([float(p1[1]) * math.cos(float(p1[0])), float(p1[1]) * math.sin(float(p1[0]))], dtype=float)
+            b_xy = np.array([float(p2[1]) * math.cos(float(p2[0])), float(p2[1]) * math.sin(float(p2[0]))], dtype=float)
 
-        if info.get("circle"):
-            a, r = float(info["circle"][0]), float(info["circle"][1])
-            return np.array([[r * math.cos(a), r * math.sin(a)]], dtype=float)
+            t = self._ray_segment_intersection(u, a_xy, b_xy)
+            if t is not None:
+                p = t * u
+                a_p, r_p = self._xy_to_polar(p)
+                return {
+                    "closest_point_xy": [float(p[0]), float(p[1])],
+                    "closest_point_polar": [float(a_p), float(r_p)],
+                    "t_hit": float(t),
+                    "abs_dist": 0.0
+                }
+
+            cand = self._closest_point_on_segment_to_ray(u, a_xy, b_xy)
+            p = cand["p"]
+            a_p, r_p = self._xy_to_polar(p)
+            return {
+                "closest_point_xy": [float(p[0]), float(p[1])],
+                "closest_point_polar": [float(a_p), float(r_p)],
+                "t_hit": float(cand["t"]),
+                "abs_dist": float(cand["absd"])
+            }
 
         return None
 
-    # ----------------- Avoidance computation (core output) -----------------
-    def compute_avoid_output(self, intended_angle, intended_magnitude, intended_hits, angles, ranges):
-        """
-        OUTPUT LOGIC FLOW
+    # ============================================================
+    #  Free-space midpoint on orthogonal line through closest point
+    # ============================================================
+    def _merge_intervals(self, intervals):
+        if not intervals:
+            return []
+        intervals = sorted(intervals, key=lambda t: t[0])
+        out = [list(intervals[0])]
+        for a, b in intervals[1:]:
+            if a <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return [(x[0], x[1]) for x in out]
 
-        A) Build intended direction u_hat from intended_angle.
-        B) Choose "first obstacle hit":
-           - for each hit obstacle:
-             - get its representative points in XY
-             - find the point with smallest abs distance to intended line
-             - compute along-distance for that point
-           - choose the obstacle with MIN positive along-distance
+    def _subtract_intervals(self, base, blocks):
+        L, R = base
+        free = []
+        cur = L
+        for a, b in blocks:
+            if b <= cur:
+                continue
+            if a > cur:
+                free.append((cur, min(a, R)))
+            cur = max(cur, b)
+            if cur >= R:
+                break
+        if cur < R:
+            free.append((cur, R))
+        return [(a, b) for a, b in free if (b - a) > 1e-4]
 
-        C) Compute danger:
-           - d = abs(perp distance)
-           - danger = clamp((safety_radius - d)/safety_radius)
+    def _occupied_interval_circle_on_line(self, p0, n_hat, c_xy, radius, inflate=0.0):
+        p0 = np.asarray(p0, float)
+        n = self._unit(np.asarray(n_hat, float))
+        c = np.asarray(c_xy, float)
+        r = float(radius) + float(inflate)
 
-        D) Choose left vs right:
-           - geometric side = sign of signed_dist (closest point)
-           - free-space side = score left and right cones using lidar points
-           - if free-space difference is tiny => use geometric tie-break
+        dvec = c - p0
+        s_c = float(np.dot(dvec, n))
+        perp = dvec - s_c * n
+        d = float(np.linalg.norm(perp))
+        if d >= r:
+            return None
+        ds = math.sqrt(max(0.0, r*r - d*d))
+        return (s_c - ds, s_c + ds)
 
-        E) Compute avoid vector:
-           v_out = forward_keep * v_intended + mag_side * n_avoid
-           cap to intended magnitude
-        """
-        intended_magnitude = float(intended_magnitude)
-        if intended_magnitude <= 1e-6:
-            return [0.0, 0.0], None
+    def _occupied_interval_segment_on_line(self, p0, n_hat, a_xy, b_xy, inflate=0.0):
+        n = self._unit(np.asarray(n_hat, float))
+        p0 = np.asarray(p0, float)
+        a = np.asarray(a_xy, float)
+        b = np.asarray(b_xy, float)
 
+        v = b - a
+        denom = self._cross2(n, v)
+        if abs(denom) < 1e-12:
+            sa = float(np.dot(a - p0, n))
+            sb = float(np.dot(b - p0, n))
+            lo, hi = (sa, sb) if sa <= sb else (sb, sa)
+            return (lo - inflate, hi + inflate)
+
+        s = self._cross2((a - p0), v) / denom
+        t = self._cross2((a - p0), n) / denom
+        if 0.0 <= t <= 1.0:
+            return (float(s - inflate), float(s + inflate))
+        return None
+
+    def _occupied_interval_rect_on_line(self, p0, n_hat, rect_xy, inflate=0.0):
+        pts = np.asarray(rect_xy, float)
+        if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 3:
+            return None
+
+        n = self._unit(np.asarray(n_hat, float))
+        p0 = np.asarray(p0, float)
+        hits_s = []
+        for i in range(len(pts)):
+            a = pts[i]
+            b = pts[(i + 1) % len(pts)]
+            v = b - a
+            denom = self._cross2(n, v)
+            if abs(denom) < 1e-12:
+                continue
+            s = self._cross2((a - p0), v) / denom
+            t = self._cross2((a - p0), n) / denom
+            if 0.0 <= t <= 1.0:
+                hits_s.append(float(s))
+
+        if len(hits_s) >= 2:
+            return (min(hits_s) - inflate, max(hits_s) + inflate)
+
+        # fallback projection
+        proj = [float(np.dot(p - p0, n)) for p in pts]
+        return (min(proj) - inflate, max(proj) + inflate)
+
+    def free_space_midpoint_on_orthogonal(self, intended_angle, closest_point_xy, obstacles):
         u_hat = self._unit(self._ray_dir(float(intended_angle)))
-        v_intended = u_hat * intended_magnitude
+        n_hat = np.array([-u_hat[1], u_hat[0]], dtype=float)
+        p0 = np.asarray(closest_point_xy, float)
 
-        if not intended_hits:
-            return [float(v_intended[0]), float(v_intended[1])], None
+        base = (-float(self.free_max_step), float(self.free_max_step))
+        blocks = []
 
-        # look distance scales with stick magnitude (so if stick is small, you look shorter)
-        look_dist = max(1e-6, float(self.look_distance) * intended_magnitude)
-
-        # ---- A) choose the first obstacle hit ----
-        best = None
-        for h in intended_hits:
+        for h in obstacles:
             info = (h or {}).get("info", {}) or {}
-            pts = self._obstacle_points_xy(info)
-            if pts is None or len(pts) == 0:
-                continue
+            lab = info.get("label", "")
 
-            # find the representative point closest to intended line (and in front)
-            best_p = None
-            best_absd = None
-            best_sd = None
-            best_along = None
+            if lab == "rectangle" and info.get("rect_xy"):
+                iv = self._occupied_interval_rect_on_line(p0, n_hat, info["rect_xy"], inflate=self.closest_inflate)
+                if iv: blocks.append(iv)
 
-            for p in pts:
-                along = self._along_intended(p, u_hat)
-                if along <= 0.0 or along > look_dist:
-                    continue
+            elif lab == "circle" and info.get("circle"):
+                a, r = float(info["circle"][0]), float(info["circle"][1])
+                c_xy = np.array([r * math.cos(a), r * math.sin(a)], dtype=float)
+                rad = float(info.get("radius_est", self.circle_radius_est))
+                iv = self._occupied_interval_circle_on_line(p0, n_hat, c_xy, rad, inflate=self.closest_inflate)
+                if iv: blocks.append(iv)
 
-                sd = self._signed_dist_to_intended_line(p, u_hat)
-                absd = abs(sd)
+            elif lab == "line" and info.get("line"):
+                p1, p2 = info["line"][0], info["line"][1]
+                a_xy = np.array([float(p1[1]) * math.cos(float(p1[0])),
+                                 float(p1[1]) * math.sin(float(p1[0]))], dtype=float)
+                b_xy = np.array([float(p2[1]) * math.cos(float(p2[0])),
+                                 float(p2[1]) * math.sin(float(p2[0]))], dtype=float)
+                iv = self._occupied_interval_segment_on_line(p0, n_hat, a_xy, b_xy, inflate=self.closest_inflate)
+                if iv: blocks.append(iv)
 
-                if best_absd is None or absd < best_absd:
-                    best_absd = absd
-                    best_sd = sd
-                    best_along = along
-                    best_p = p
+        # clip + merge
+        clipped = []
+        for a, b in blocks:
+            a2 = max(base[0], float(a))
+            b2 = min(base[1], float(b))
+            if b2 > a2:
+                clipped.append((a2, b2))
+        merged = self._merge_intervals(clipped)
 
-            if best_p is None:
-                continue
+        free = self._subtract_intervals(base, merged)
+        if not free:
+            return None
 
-            if best is None or best_along < best["along"]:
-                best = {
-                    "hit": h,
-                    "info": info,
-                    "p_closest": np.array(best_p, dtype=float),
-                    "signed_dist": float(best_sd),
-                    "abs_dist": float(best_absd),
-                    "along": float(best_along),
-                }
+        best = max(free, key=lambda ab: (ab[1] - ab[0]))
+        s_mid = 0.5 * (best[0] + best[1])
+        p_mid = p0 + s_mid * self._unit(n_hat)
+        a_mid, r_mid = self._xy_to_polar(p_mid)
 
-        if best is None:
-            return [float(v_intended[0]), float(v_intended[1])], None
-
-        # ---- B) danger based on how close you are to the line ----
-        sr = max(1e-6, float(self.safety_radius))
-        d = float(best["abs_dist"])
-        danger = max(0.0, min(1.0, (sr - d) / sr))
-
-        # stronger if obstacle is closer along direction
-        along_factor = max(0.0, min(1.0, (look_dist - best["along"]) / look_dist))
-
-        # ---- C) choose left vs right ----
-        n_left = np.array([-u_hat[1], u_hat[0]], dtype=float)
-
-        # geometric preference (fallback)
-        side_geom = -1.0 if best["signed_dist"] > 0.0 else 1.0  # obstacle left => push right
-
-        # free-space preference
-        side_fs, fs_dbg = self._pick_side_by_free_space(
-            angles=np.asarray(angles, dtype=float),
-            ranges=np.asarray(ranges, dtype=float),
-            intended_theta=float(intended_angle),
-            n_left=n_left,
-            k=float(self.side_test_k),
-        )
-
-        # tie-break: if both sides are similarly open, use geometric
-        if abs(fs_dbg["clearL"] - fs_dbg["clearR"]) < self.side_tie_eps:
-            side_sign = side_geom
-            side_reason = "geom_tie"
-        else:
-            side_sign = side_fs
-            side_reason = "free_space"
-
-        n_avoid = n_left * float(side_sign)
-
-        # ---- D) compute side magnitude + output ----
-        mag_side = self.side_gain * danger * (0.35 + 0.65 * along_factor) * intended_magnitude
-
-        v_out = (self.forward_keep * v_intended) + (mag_side * n_avoid)
-
-        # cap magnitude so we don't overdrive
-        out_norm = float(np.linalg.norm(v_out))
-        if out_norm > 1e-6 and out_norm > intended_magnitude:
-            v_out = v_out * (intended_magnitude / out_norm)
-
-        # ---- E) debug payload for UI ----
-        pts_all = self._obstacle_points_xy(best["info"])
-        mid_xy = None
-        if pts_all is not None and len(pts_all) > 0:
-            mid = np.mean(np.asarray(pts_all, dtype=float), axis=0)
-            mid_xy = [float(mid[0]), float(mid[1])]
-
-        chosen = {
-            "along": float(best["along"]),
-            "abs_dist": float(best["abs_dist"]),
-            "signed_dist": float(best["signed_dist"]),
-            "closest_point_xy": [float(best["p_closest"][0]), float(best["p_closest"][1])],
-            "midpoint_xy": mid_xy,
-            "danger": float(danger),
-            "side": "left" if side_sign > 0 else "right",
-            "side_reason": side_reason,
-            "free_space": fs_dbg,  # includes clearL/clearR and thetaL/thetaR
+        return {
+            "best_free": [float(best[0]), float(best[1])],
+            "s_mid": float(s_mid),
+            "midpoint_xy": [float(p_mid[0]), float(p_mid[1])],
+            "midpoint_polar": [float(a_mid), float(r_mid)],
         }
+    def clamp(self, v, lo=-1.0, hi=1.0):
+        return max(lo, min(hi, float(v)))
 
-        return [float(v_out[0]), float(v_out[1])], chosen
+    def world_to_body_xy(self, p_xy, yaw):
+        """
+        Rotate a point/vector from world/plot frame into robot/body frame.
+        yaw is robot heading in world/plot frame.
+        """
+        x, y = float(p_xy[0]), float(p_xy[1])
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        # R(-yaw) * [x,y]
+        bx =  cy * x + sy * y
+        by = -sy * x + cy * y
+        return [bx, by]
 
-    # ----------------- Main loop -----------------
+    def free_midpoint_to_axes(self, free_mid_xy, yaw, mag=1.0):
+        """
+        free_mid_xy: [x,y] in world frame.
+        Returns (LX, LY) in body/joystick convention:
+        LY forward, LX right
+        """
+        # 1) direction in world (origin -> point)
+        v_world = np.array([float(free_mid_xy[0]), float(free_mid_xy[1])], dtype=float)
+        n = float(np.linalg.norm(v_world))
+        if n < 1e-9:
+            return 0.0, 0.0
+
+        v_world /= n
+
+        # 2) rotate into body frame so "forward" is consistent
+        bx, by = self.world_to_body_xy(v_world, yaw)
+
+        # 3) map body -> joystick
+        # body x = forward, body y = left (based on your world_to_body)
+        # you want LY forward, LX right:
+        LY = bx
+        LX = -by  # because body +y is left, so right is negative
+
+        # 4) scale + clamp
+        LX = self.clamp(LX * mag)
+        LY = self.clamp(LY * mag)
+        return LX, LY
+
+    # ============================================================
+    #  Main loop
+    # ============================================================
     async def run(self):
         print(f"[SAFETY] WebSocket server on port {self.ws_port}")
         async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port):
             print("[SAFETY] Listening for close obstacles and controller inputs...")
-
+            lx = ly = 0.0
             while True:
                 # 1) READ LIDAR PAYLOAD
                 lidar_data = self.state.lidar_close or {}
                 angles = np.asarray(lidar_data.get("angles", []), dtype=float)
                 ranges = np.asarray(lidar_data.get("ranges", []), dtype=float)
                 clusters = lidar_data.get("clusters", []) or []
-                yaw = lidar_data.get("yaw", None)
+                yaw = float(lidar_data.get("yaw", 0.0)) % (2 * np.pi)
 
                 # 2) READ DRIVER INTENT (lx, ly)
-                lx = ly = 0.0
-                if self.state.robot_current == 1:
-                    lx = float(self.state.axes.get("LX", 0.0))
-                    ly = float(self.state.axes.get("LY", 0.0))
-                elif self.state.robot_current in (2, 3):
-                    lx = float(self.state.command_vector.get("LX", 0.0))
-                    ly = float(self.state.command_vector.get("LY", 0.0))
-
-                # If yaw isn't ready, still broadcast to keep UI alive
-                if yaw is None:
-                    safety_payload = {
-                        "type": "safety",
-                        "intended_vector": None,
-                        "intended_hits": [],
-                        "n_clusters": len(clusters),
-                        "avoid_vector": None,
-                        "chosen_obstacle": None,
-                    }
-                    self.state.safety = safety_payload
-                    await self.broadcast_safety(safety_payload)
-                    await asyncio.sleep(0.05)
-                    continue
-
-                yaw = float(yaw) % (2 * np.pi)
+                if getattr(self.state, "robot_current", 0) == 1:
+                    lx = float(getattr(self.state, "axes", {}).get("LX", 0.0))
+                    ly = float(getattr(self.state, "axes", {}).get("LY", 0.0))
 
                 # 3) COMPUTE INTENDED DIRECTION (MUST MATCH YOUR LIDAR FRAME)
-                # Your current mapping:
                 joy_theta = (np.arctan2(lx, ly)) % (2 * np.pi)
-
-                # IMPORTANT:
-                # If you are still using the lidar flip:
-                # angles_out = (pi - (angles_rad + yaw)) % 2pi
-                # then intended_angle should be:
-                # intended_angle = (np.pi - (joy_theta + yaw)) % (2*np.pi)
-                #
-                # If you are not flipping, keep this:
                 intended_angle = (joy_theta + yaw) % (2 * np.pi)
-
                 intended_magnitude = float(np.hypot(lx, ly))
-                intended_look = intended_magnitude * float(self.look_distance)
-                intended_directional_vector = [float(intended_angle), float(intended_look)]
+                intended_look = min(self.look_distance, intended_magnitude * float(self.look_distance))
+                intended_vector = [float(intended_angle), float(intended_look)]
 
                 # 4) FILTER + CLASSIFY OBSTACLES IN THE INTENDED SLICE
                 intended_hits = []
                 for cl in clusters:
                     a1, a0 = float(cl[0][0]), float(cl[0][1])
-                    r1, r0 = float(cl[1][0]), float(cl[1][1])
-
-                    # keep clusters that overlap the intended ray angle
-                    if not self.angle_in_interval(intended_angle, a0, a1):
-                        continue
-
-                    # keep clusters within the intended look-ahead length
-                    if r0 > intended_look:
+                    if not self.angle_in_interval(intended_angle, a0, a1, padding=25):
                         continue
 
                     info = self.classify_cluster(cl, angles, ranges)
-                    intended_hits.append({"cluster": cl, "info": info})
+                    if info.get("label") == "degenerate":
+                        continue
 
-                # 5) COMPUTE AVOID OUTPUT (PREFERRED SIDE IS FREE SPACE)
-                avoid_xy, chosen = self.compute_avoid_output(
-                    intended_angle=intended_angle,
-                    intended_magnitude=intended_magnitude,
-                    intended_hits=intended_hits,
-                    angles=angles,
-                    ranges=ranges,
-                )
+                    hit = {"cluster": cl, "info": info}
 
-                # 6) BROADCAST
-                safety_payload = {
+                    # ---- closest point (for HTML red dot) ----
+                    closest = self.closest_point_to_intended_ray(info, intended_angle)
+                    if closest:
+                        hit["closest"] = closest
+                        # Also print polar for ease of interpretation
+                        ap, rp = closest["closest_point_polar"]
+                        print(f"[CLOSEST] label={info.get('label')}  a={ap:.3f}  r={rp:.3f}  t={closest.get('t_hit',0):.3f}")
+
+                    intended_hits.append(hit)
+
+                # 5) Choose the "active" hit by smallest positive t_hit (ray intersection wins)
+                active_idx = None
+                active_t = None
+                for i, h in enumerate(intended_hits):
+                    c = h.get("closest")
+                    if not c:
+                        continue
+                    t = float(c.get("t_hit", 1e9))
+                    if t >= 0.0 and (active_t is None or t < active_t):
+                        active_t = t
+                        active_idx = i
+
+                # 6) Free-space midpoint on orthogonal line through active closest point
+                if active_idx is not None:
+                    p0 = intended_hits[active_idx]["closest"]["closest_point_xy"]
+                    fs = self.free_space_midpoint_on_orthogonal(intended_angle, p0, intended_hits)
+                    if fs:
+                        intended_hits[active_idx]["free_space"] = fs
+
+                        # ---- NEW: convert free midpoint to joystick axes ----
+                        mid_xy = fs["midpoint_xy"]              # [x,y] in world frame
+                        LX, LY = self.free_midpoint_to_axes(mid_xy, yaw, mag=intended_magnitude)
+
+                        # publish to your control layer (choose ONE approach)
+                        self.state.safe_axes["LX"] = float(LX*-1*.80)
+                        self.state.safe_axes["LY"] = float(LY*.80)
+
+                        # optional debug print
+                        a_mid, r_mid = fs["midpoint_polar"]
+                        print(f"[FREE->AXES] mid(a={a_mid:.3f}, r={r_mid:.3f}) -> LX={LX:.3f} LY={LY:.3f}")
+
+                # 7) BROADCAST what the HTML expects
+                payload = {
                     "type": "safety",
-                    "intended_vector": intended_directional_vector,
+                    "yaw": float(yaw),
+                    "intended_vector": intended_vector,
                     "intended_hits": intended_hits,
-                    "n_clusters": len(clusters),
-                    "avoid_vector": avoid_xy,      # [vx, vy] in XY frame
-                    "chosen_obstacle": chosen,     # debug for UI
+                    "n_clusters": int(len(clusters)),
                 }
-                print(avoid_xy)
+                await self.broadcast_safety(payload)
 
-                self.state.safety = safety_payload
-                await self.broadcast_safety(safety_payload)
                 await asyncio.sleep(0.05)  # ~20 Hz

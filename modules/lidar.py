@@ -89,9 +89,9 @@ class LidarModule:
         """Wrap-safe signed difference a-b in radians, in [-pi, pi]."""
         return (a - b + math.pi) % (2.0 * math.pi) - math.pi
     def fill_angle_gaps(self, angles_rad, ranges_m,
-                        angle_step_deg=0.5,
-                        max_fill_gap_deg=10.0,
-                        dist_gap_m=0.5):
+                        angle_step_deg=0.25,
+                        max_fill_gap_deg=15.0, # gap between two angles no greater than 10
+                        dist_gap_m=1.0): # Distance between two points
         """
         Returns:
         filled_a, filled_r: with inserted points for moderate gaps (same as before)
@@ -232,8 +232,8 @@ class LidarModule:
                         angles_out,
                         ranges_m,
                         angle_step_deg=0.125,      # insert every 0.5°
-                        max_fill_gap_deg=10.0,   # don't fill if gap is huge
-                        dist_gap_m=0.5
+                        max_fill_gap_deg=15.0,   # don't fill if gap is huge
+                        dist_gap_m=0.675
                     )
                     # -------------------------------------------------------
 
