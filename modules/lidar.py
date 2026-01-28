@@ -31,22 +31,27 @@ class LidarModule:
         finally:
             self.clients.discard(websocket)
 
-    async def broadcast_scan(self, angles_rad, ranges_m, intensity):
+    async def broadcast_scan(self, angles_rad, ranges_m, intensity, clusters=None, yaw=None):
         if not self.clients:
             return
+
         payload = {
             "type": "scan",
-            "angles": angles_rad,
+            "angles": angles_rad,     # the angles you actually want to plot (you are using angles_filled)
             "ranges": ranges_m,
             "intensity": intensity,
             "range_max": config.LIDAR_MAX_RANGE,
+            "clusters": clusters or [],   # [[[a1,a0],[r1,r0]], ...]
+            "yaw": float(yaw) if yaw is not None else None,
         }
+
         msg = json.dumps(payload)
         for ws in list(self.clients):
             try:
                 await ws.send(msg)
             except Exception:
                 pass
+
 
     def _rate_tick(self):
         """Print intake/broadcast rates every ~1s."""
@@ -130,7 +135,6 @@ class LidarModule:
 
             filled_a.append(a1)
             filled_r.append(r1)
-
         return filled_a, filled_r, clusters
     # ----------------------------------------------------
 
@@ -185,9 +189,9 @@ class LidarModule:
 
                     # --------- GAP FILL (added, minimal intrusion) ---------
                     # Fill missing intermediate angles/ranges for small gaps.
-                    yaw = np.deg2rad(float(self.state.stm["yaw"])+90)
+                    yaw = np.deg2rad(float(self.state.stm["yaw"]))
                     angles = (np.asarray(angles_rad, dtype=float) + yaw) % (2*np.pi)
-                    angles_out = ((np.pi - angles) % (2*np.pi)).tolist()
+                    angles_out = ((angles) % (2*np.pi)).tolist()
                     angles_filled, ranges_filled,clusters = self.fill_angle_gaps(
                         angles_out,
                         ranges_m,
@@ -202,7 +206,7 @@ class LidarModule:
                     # The second set of arrays is indexed by a subset of angles that are <= 1.0 meters in distance.
 
                     # This is the dictionary that holds a set of arrays that are indexed by <= 1.0 meters in distance. 
-                    self.state.lidar_close = {"angles": angles_filled, "ranges": ranges_filled, "clusters":clusters} # Using angles filled
+                    self.state.lidar_close = {"angles": angles_filled, "ranges": ranges_filled, "clusters":clusters, "yaw":yaw} # Using angles filled
 
                     if ranges_m and self.loop: # If ranges_m is not empty
                         # ---- broadcast attempt counter ----
@@ -210,11 +214,11 @@ class LidarModule:
                             self._tx_scans += 1
                         # -----------------------------------
 
-                        # Websocket broadcast
                         asyncio.run_coroutine_threadsafe(
-                            self.broadcast_scan(angles_filled, ranges_filled, intensity), # using angles_out for 
+                            self.broadcast_scan(angles_filled, ranges_filled, intensity, clusters=clusters, yaw=yaw),
                             self.loop
                         )
+
 
                         # Update state with the lidar payload for the broadcaster
                         self.state.lidar_payload = {

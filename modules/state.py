@@ -49,7 +49,7 @@ class RobotState:
         # Lidar Zone
         self.zone = {"zone": "Far", "x_sum": 0.0, "y_sum": 0.0}
         # Lidar Close Data (Points <= close distance)
-        self.lidar_close = {"angles": [], "ranges": [], "clusters": []}
+        self.lidar_close = {"angles": [], "ranges": [], "clusters": [], "yaw":0}
         # Lidar Full Scan
         self.lidar_full_scan = {}
         # Lidar Payload for UDP
@@ -87,6 +87,11 @@ class RobotState:
         }
         # Safe Motor Commands (Calculated by SafetyModule)
         self.safe_axes = {"LX": 0.0, "LY": 0.0,"W":0.0}
+        self.safety = {
+            "intended_vector": [],
+            "intended_hits": [],
+            "n_clusters": 0,
+        }
         # Translational Coordinates
         self.tf_pose = None
         # The starting position will always be 0,0,0

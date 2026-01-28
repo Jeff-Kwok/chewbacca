@@ -1,0 +1,150 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Lidar + Clusters</title>
+  <style>
+    body { margin: 0; background: #0b1020; color: #e5e7eb; font-family: sans-serif; }
+    #top { padding: 10px 12px; display: flex; gap: 16px; align-items: center; }
+    canvas { display: block; margin: 0 auto; background: #050816; }
+    .pill { padding: 4px 10px; border-radius: 999px; background: #111827; }
+  </style>
+</head>
+<body>
+  <div id="top">
+    <div class="pill" id="status">Disconnected</div>
+    <div class="pill" id="stats">—</div>
+  </div>
+  <canvas id="c" width="900" height="900"></canvas>
+
+<script>
+const WS_URL = `ws://${location.hostname}:8765`; // <-- change port to config.LIDAR_WS_PORT if different
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const statsEl = document.getElementById("stats");
+
+const W = canvas.width, H = canvas.height;
+const cx = W/2, cy = H/2;
+
+// scale meters to pixels
+const METERS_TO_PX = 120;   // adjust depending on your range
+const MAX_DRAW_M = 6.0;     // cap drawing distance for visibility
+
+function polarToXY(angle, r) {
+  // In canvas: +x right, +y down. Flip y for normal math-y up.
+  const x = cx + Math.cos(angle) * r * METERS_TO_PX;
+  const y = cy - Math.sin(angle) * r * METERS_TO_PX;
+  return [x, y];
+}
+
+function clear() {
+  ctx.clearRect(0,0,W,H);
+  // origin cross
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.15)";
+  ctx.beginPath();
+  ctx.moveTo(cx-12, cy); ctx.lineTo(cx+12, cy);
+  ctx.moveTo(cx, cy-12); ctx.lineTo(cx, cy+12);
+  ctx.stroke();
+
+  // range rings
+  for (let r=1; r<=5; r++) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r*METERS_TO_PX, 0, Math.PI*2);
+    ctx.stroke();
+  }
+}
+
+function drawPoints(angles, ranges) {
+  ctx.fillStyle = "rgba(120, 200, 255, 0.9)";
+  for (let i=0; i<angles.length; i++) {
+    const a = angles[i];
+    const r = ranges[i];
+    if (!isFinite(a) || !isFinite(r)) continue;
+    if (r <= 0 || r > MAX_DRAW_M) continue;
+
+    const [x,y] = polarToXY(a, r);
+    ctx.fillRect(x, y, 2, 2);
+  }
+}
+
+function drawClusters(clusters) {
+  // Draw each cluster as a line between its endpoints
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255, 120, 120, 0.95)";
+
+  for (const cl of clusters) {
+    if (!cl || cl.length < 2) continue;
+    const a1 = Number(cl[0][0]);
+    const a0 = Number(cl[0][1]);
+    const r1 = Number(cl[1][0]);
+    const r0 = Number(cl[1][1]);
+    if (![a0,a1,r0,r1].every(Number.isFinite)) continue;
+
+    const [x0,y0] = polarToXY(a0, r0);
+    const [x1,y1] = polarToXY(a1, r1);
+
+    ctx.beginPath();
+    ctx.moveTo(x0,y0);
+    ctx.lineTo(x1,y1);
+    ctx.stroke();
+
+    // endpoint dots
+    ctx.fillStyle = "rgba(255, 120, 120, 1.0)";
+    ctx.beginPath(); ctx.arc(x0,y0,3,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x1,y1,3,0,Math.PI*2); ctx.fill();
+  }
+}
+
+function drawYaw(yaw) {
+  if (!isFinite(yaw)) return;
+  // draw a heading ray (1.5m)
+  const r = 1.5;
+  const [x,y] = polarToXY(yaw, r);
+
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(120, 255, 150, 0.95)";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(x, y);
+  ctx.stroke();
+}
+
+let lastMsgT = performance.now();
+
+function handleScan(msg) {
+  const angles = msg.angles || [];
+  const ranges = msg.ranges || [];
+  const clusters = msg.clusters || [];
+  const yaw = msg.yaw;
+
+  clear();
+  drawPoints(angles, ranges);
+  drawClusters(clusters);
+  drawYaw(yaw);
+
+  statsEl.textContent = `pts=${angles.length} clusters=${clusters.length} yaw=${(yaw*180/Math.PI).toFixed(1)}°`;
+}
+
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  statusEl.textContent = "Connecting…";
+
+  ws.onopen = () => { statusEl.textContent = "Connected"; };
+  ws.onclose = () => { statusEl.textContent = "Disconnected (retrying…)"; setTimeout(connect, 800); };
+  ws.onerror = () => { /* handled by onclose */ };
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "scan") handleScan(msg);
+    } catch(e) {}
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
