@@ -231,9 +231,9 @@ class LidarModule:
                     angles_filled, ranges_filled,clusters = self.fill_angle_gaps(
                         angles_out,
                         ranges_m,
-                        angle_step_deg=0.125,      # insert every 0.5°
-                        max_fill_gap_deg=15.0,   # don't fill if gap is huge
-                        dist_gap_m=0.675
+                        angle_step_deg=0.5,      # insert every 0.5°
+                        max_fill_gap_deg=10.0,   # don't fill if gap is huge
+                        dist_gap_m=0.5
                     )
                     # -------------------------------------------------------
 
