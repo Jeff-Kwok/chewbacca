@@ -24,7 +24,7 @@ async def camera_loop(state: RobotState):
     Main loop for camera processing. Runs in a separate thread to avoid blocking asyncio.
     """
     print("[CAM] Starting camera loop...")
-    cam = CameraStereo(RobotState())
+    cam = CameraStereo(state)
     
     loop = asyncio.get_running_loop()
 

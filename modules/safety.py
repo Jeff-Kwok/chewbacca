@@ -47,13 +47,13 @@ class SafetyModule:
         self.state = state
 
         # --- How far ahead the look-ahead ray extends when stick magnitude is 1.0 ---
-        self.look_distance = 10
+        self.look_distance = 5.0
 
         # --- include all clusters within this radius (meters), regardless of intended angle ---
         self.zone_radius = 1.5
 
         # --- NEW: "visible arc" filter around intended ray ---
-        self.visible_arc_deg = 30.0  # ±30° around intended_angle
+        self.visible_arc_deg = 25.0  # ±30° around intended_angle
 
         # --- Cluster merge params (pre-classification) ---
         self.merge_angle_tol_deg = 3.5     # degrees
@@ -74,23 +74,23 @@ class SafetyModule:
         self.circle_radius_est = 0.24   # meters (approx obstacle thickness for "circle-ish" clusters)
 
         # ---- Number-line sampling density ----
-        self.dense_rect_points = 60     # NEW: many points along closest rectangle edge
-        self.dense_line_points = 60      # keep 0 to NOT densify lines by default (endpoints only)
+        self.dense_rect_points = 20     # NEW: many points along closest rectangle edge
+        self.dense_line_points = 20      # keep 0 to NOT densify lines by default (endpoints only)
 
         # ---- NEW: Repulsion zone parameters (5.0 -> 1.5 -> 0.0) ----
         # We keep zone_radius as the "hard" radius (1.5m) for include_by_zone.
-        self.zone_outer_radius = 3.5      # meters (soft influence begins)
-        self.zone_inner_radius = 1.0      # meters (hard influence boundary)
+        self.zone_outer_radius = 1.2      # meters (soft influence begins)
+        self.zone_inner_radius = 0.60      # meters (hard influence boundary)
 
         # Repulsion scale factors (negative = repel)
         # 5.0 -> 1.5 : contributes toward -1.0
         # 1.5 -> 0.0 : contributes toward -2.0
-        self.repulse_outer_gain = 1.0
-        self.repulse_inner_gain = 1.2
+        self.repulse_outer_gain = 0.75
+        self.repulse_inner_gain = 1.5
 
         # ---- Free-space interval requirements ----
-        self.min_free_interval_deg = 17.5
-        self.clear_radius = 1.5  # "no points closer than this" constraint
+        self.min_free_interval_deg = 20.0
+        self.clear_radius = 1.0  # "no points closer than this" constraint
 
         # ---- Steering clamp (how much we can limit intended angle) ----
         self.max_angle_correction = math.radians(35.0)
@@ -243,13 +243,13 @@ class SafetyModule:
             # map r: 1.5 -> 0.0 as t: 0 -> 1
             t = (self.zone_inner_radius - r) / max(1e-6, self.zone_inner_radius)
             # stronger as you get closer
-            return abs(float(self.repulse_inner_gain))+(t)
+            return abs(float(self.repulse_inner_gain))+(t) 
 
         # Outer band: 1.5..5.0
         t = (self.zone_outer_radius - r) / max(1e-6, (self.zone_outer_radius - self.zone_inner_radius))
         return abs(float(self.repulse_outer_gain)) * max(0.0, min(1.0, t))
 
-    def repulsion_against_intended(self, hits, intended_angle):
+    def repulsion_against_intended(self, hits, intended_angle,lx,ly):
         inner_a = []
         outer_a = []
         repulse_x = 0
@@ -259,45 +259,40 @@ class SafetyModule:
         all_a = []
         for h in hits:
             info = h.get("info", {}) or {}
-            for p in self.geometry_points_for_bins(info):
+            for p in h.get("geom_pts",[]):
                 if p["r"] <= self.zone_outer_radius:
                     outer_a.append((float(p["a"]), float(p["r"])))
                 if p["r"] <= self.zone_inner_radius:
                     inner_a.append(((float(p["a"]), float(p["r"]))))
 
         tol = np.deg2rad(1.5)
-
-        if any(abs(self.angle_diff(a, intended_angle)) <= tol for a, r in outer_a):
-            cands = [(i, a, r) for i, (a, r) in enumerate(outer_a)
-                    if abs(self.angle_diff(a, intended_angle)) <= tol]
-            if not cands:
-                idx = None
-            else:
-                idx, a_best, r_best = min(cands, key=lambda t: t[2])  # minimize r
-                repulse_x = -np.cos(a_best) * self.repulsion_weight(r_best)
-                repulse_y = -np.sin(a_best) * self.repulsion_weight(r_best)
-        
+        if abs(lx)>= 0.2 or abs(ly) >=0.2:
+            if any(abs(self.angle_diff(a, intended_angle)) <= tol for a, r in outer_a):
+                # Looks for candidates that intake the function and combs for angles close to intended direction
+                cands = [(i, a, r) for i, (a, r) in enumerate(outer_a)
+                        if abs(self.angle_diff(a, intended_angle)) <= tol]
+                if not cands:
+                    idx = None
+                else:
+                    # if cands is not empty we comb through candidates to minimize the closest distance
+                    idx, a_best, r_best = min(cands, key=lambda t: t[2])  # minimize r
+                    #print(a_best)
+                    repulse_x = -np.cos(a_best) * self.repulsion_weight(r_best)
+                    repulse_y = -np.sin(a_best) * self.repulsion_weight(r_best)
         for a,r in inner_a:
+            #print(a)
             repulse_dx += -np.cos(a)# * self.repulsion_weight(r)/count
             repulse_dy += -np.sin(a)# * self.repulsion_weight(r)/count
         mag = np.hypot(repulse_dx,repulse_dy)
         if mag > 1e-6:
             repulse_dx /=mag
             repulse_dy /=mag
-            strength = min(1.0,np.sqrt(len(inner_a)/5.0))
+            strength = min(1.0,np.sqrt(len(inner_a)/2.5))
             repulse_x += repulse_dx * strength
             repulse_y += repulse_dy * strength
-        final_mag = np.hypot(repulse_x, repulse_y)
-        if final_mag > 1e-6:
-            repulse_x /= final_mag
-            repulse_y /= final_mag
-        else:
-            repulse_x = 0.0
-            repulse_y = 0.0
-        
         return repulse_x,repulse_y
 
-    def largest_free_interval_in_bin(self, angle_bins, intended_angle, n_bins, *, min_span_deg=17.5, clear_r=1.5):
+    def largest_free_interval_in_bin(self, angle_bins, intended_angle, n_bins, *, min_span_deg=20.0, clear_r=1.0):
         """
         Finds the largest angular interval within the intended bin such that:
           - It spans at least min_span_deg
@@ -307,7 +302,7 @@ class SafetyModule:
           {"ok":bool, "bin_i":int, "a0":..., "a1":..., "span":..., "mid":...,
            "span_deg":..., "mid_deg":..., "blocked_count":int}
         """
-        n_bins = int(n_bins) if int(n_bins) > 0 else 8
+        n_bins = int(n_bins) if int(n_bins) > 0 else 10
         ia = self.angle_wrap_2pi(float(intended_angle))
         bi = self.bin_index_for_angle(ia, n_bins)
 
@@ -549,7 +544,7 @@ class SafetyModule:
             resid = r_seg - r_hat
         except Exception:
             return {"label": "degenerate", "n": int(a_seg.size), "reason": "fit_failed"}
-
+        '''
         fit_dbg = {
             "a_lo": float(a_lo), "a_hi": float(a_hi),
             "r_lo": float(r_lo), "r_hi": float(r_hi),
@@ -562,6 +557,7 @@ class SafetyModule:
             "resid_max": float(np.max(resid)),
             "resid_min": float(np.min(resid)),
         }
+        '''
 
         max_pos = float(np.max(resid))
         max_neg = float(np.min(resid))
@@ -571,12 +567,12 @@ class SafetyModule:
 
         if (max_pos + abs(max_neg)) > self.classify_thresh and length >= self.classify_min_distance:
             rect_xy = self.rect_xy_from_polar_cluster_bestfit(a_seg, r_seg)
-            return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size), "fit": fit_dbg}
+            return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size)}#, "fit": fit_dbg}
 
         if length >= self.classify_min_distance:
-            return {"label": "line", "line": [p1, p2], "length": length, "n": int(a_seg.size), "fit": fit_dbg}
+            return {"label": "line", "line": [p1, p2], "length": length, "n": int(a_seg.size)}#, "fit": fit_dbg}
 
-        return {"label": "circle", "circle": self.circular_payload(cluster), "n": int(a_seg.size), "fit": fit_dbg}
+        return {"label": "circle", "circle": self.circular_payload(cluster), "n": int(a_seg.size)}#, "fit": fit_dbg}
 
     # ============================================================
     #  Zone include check
@@ -680,23 +676,27 @@ class SafetyModule:
 
         return out
 
-    def build_angle_bins(self, hits, *, intended_angle, lx, ly, look_distance, n_bins=8):
+    def build_angle_bins(self, hits, *, intended_angle, lx, ly, look_distance, n_bins=10):
         """
         0..2pi number line, 4 bins of 90° each.
         Populated from GEOMETRY points.
 
         Also includes an "intent" point for joystick input.
         """
-        n_bins = int(n_bins) if int(n_bins) > 0 else 8
+        n_bins = int(n_bins) if int(n_bins) > 0 else 10
         edges = np.linspace(0.0, 2.0 * np.pi, n_bins + 1)
         bins = [{"bin_i": i, "a0": float(edges[i]), "a1": float(edges[i + 1]), "points": []} for i in range(n_bins)]
 
         for h in (hits or []):
+            if not h:
+                continue
             info = (h or {}).get("info", {}) or {}
             hid = (h or {}).get("hit_id", None)
             lab = info.get("label", "")
 
-            pts = self.geometry_points_for_bins(info)
+            pts = h.get("geom_pts",[])
+            if pts is None:
+                pts = self.geometry_points_for_bins(info)  # fallback (should be rare)
             #print(pts)
             for p in pts:
                 a = self.angle_wrap_2pi(p["a"])
@@ -768,6 +768,9 @@ class SafetyModule:
                 if getattr(self.state, "robot_current", 0) == 1:
                     lx = float(getattr(self.state, "axes", {}).get("LX", 0.0))
                     ly = float(getattr(self.state, "axes", {}).get("LY", 0.0))
+                if getattr(self.state, "robot_current", 0) >= 2:
+                    lx = float(getattr(self.state, "command_vector", {}).get("LX", 0.0))
+                    ly = float(getattr(self.state, "command_vector", {}).get("LY", 0.0))
 
                 # 3) COMPUTE INTENDED DIRECTION (MUST MATCH YOUR LIDAR FRAME)
                 joy_theta = self.joy_to_angle(lx, ly)
@@ -794,11 +797,12 @@ class SafetyModule:
                     info = self.classify_cluster(cl, angles, ranges)
                     if info.get("label") == "degenerate":
                         continue
-
+                    geom_pts = self.geometry_points_for_bins(info)
                     hit = {
                         "hit_id": int(hit_id_counter),
                         "cluster": cl,
                         "info": info,
+                        "geom_pts": geom_pts,
                         "r_min": float(rmin),
                         "include_by": {
                             "visible_arc": bool(include_by_visible_arc),
@@ -809,7 +813,7 @@ class SafetyModule:
                     hits.append(hit)
 
                 # 6) Build 0..2pi "number-line" bins using GEOMETRY points
-                n_bins = 8
+                n_bins = 10
                 angle_bins = self.build_angle_bins(
                     hits,
                     intended_angle=float(intended_angle),
@@ -827,36 +831,49 @@ class SafetyModule:
                     min_span_deg=float(self.min_free_interval_deg),
                     clear_r=float(self.clear_radius),
                 )
-                repulse_x, repulse_y = self.repulsion_against_intended(hits,intended_angle)
+
                 #rint(repulse_x,repulse_y)
                 # repulse_x, repulse_y are WORLD frame (unit)
                 # yaw is robot heading in world
-
-                # --- rotate world repulsion into ROBOT frame ---
-                c = np.cos(yaw)
-                s = np.sin(yaw)
-
-                repulse_ry =  c * repulse_x + s * repulse_y
-                repulse_rx = -s * repulse_x + c * repulse_y
-
-                # --- blend with joystick (robot frame) ---
-                k = 1.0  # repulsion strength (tune)
-                lx_corr = lx + k * repulse_rx
-                ly_corr = ly + k * repulse_ry
-
-                # optional clamp
-                mag = np.hypot(lx_corr, ly_corr)
-                if mag > 1e-6:
-                    lx_corr /= max(1.0, mag)
-                    ly_corr /= max(1.0, mag)
-
-                # --- back to angle using YOUR convention ---
-                corrected_angle = self.angle_wrap(np.arctan2(lx_corr, ly_corr))
-
-                print(f"lx_corr {lx_corr:.2f} ly_corr: {ly_corr:.2f} repulse_x: {repulse_x:.2f} repulse_y: {repulse_y:.2f} lx: {lx} ly: {ly}")
-                #print(np.cos(corrected_angle) + lx) 
-                #print(np.sin(corrected_angle) + ly) 
-                # 7) BROADCAST
+                repulse_wx, repulse_wy = self.repulsion_against_intended(hits, intended_angle, lx, ly)
+                s = np.cos(yaw)
+                c = np.sin(yaw)
+                repulse_wx_corrected = (c*repulse_wx*-1 + s*repulse_wy)  
+                repulse_wy_corrected = (s*repulse_wx + c*repulse_wy)
+                
+                # controller input  = repulse_wx + lx
+                # 3) WORLD free-space vector (only if ok)
+                free_wx = 0.0
+                free_wy = 0.0
+                if free.get("ok") and free.get("span", 0.0) > 0.25:
+                    #span_norm = np.clip(free["span_deg"] / 45.0, 0.0, 1.0)  # 0..1
+                    #w = np.log1p(9.0 * span_norm) / np.log1p(9.0)          # 0..1
+                    # free["mid"] is a WORLD angle -> use cos/sin
+                    #print(f"w: {w:.2f}")
+                    #free["mid"] = (free["mid"] +np.pi/2) % (2*np.pi)
+                    #print(self.angle_diff(intended_angle,free["mid"]))
+                    free_wx = ((intended_angle - free["mid"]))%(2*np.pi)
+                    free_wdx = s*np.cos(free_wx) + -c*np.sin(free_wx)
+                    free_wdy = c*np.sin(free_wx) + s*np.sin(free_wx)
+                    #print(free_wdx,free_wdy)
+                #print(f"free: {free['mid']:.2f} yaw: {yaw:.2f} intended: {intended_angle:.2f}") # We can take free_wx as our rtational vector
+                # 4) Combine in WORLD (this is the correct place)
+                kR = 1.15   # repulsion strength
+                kF = 0.32   # free-space strength (tune)
+                # 5) WORLD -> ROBOT for controller axes
+                lx_corr =  repulse_wx_corrected * kR + lx*.60 -free_wdy*0.32 
+                ly_corr =  repulse_wy_corrected * kR + ly *.60
+                # 6) Your convention angle (robot frame)
+                corrected_angle = self.angle_wrap(np.arctan2(ly_corr, lx_corr))
+                #print(
+                    #f"repulse_w ({repulse_wx:.2f},{repulse_wy:.2f}) "
+                    #f"repulse_w_corrected ({repulse_wx_corrected:.2f},{repulse_wy_corrected:.2f},{free_wx:.2f} ) "
+                    #f"yaw: {yaw:.2f} | cos: {c:.2f} sin: {s:.2f} angle: {np.arctan2(repulse_wy,repulse_wx):.2f}"
+                #)
+                self.state.safe_axes["LX"] = lx_corr
+                self.state.safe_axes["LY"] = ly_corr
+                self.state.safe_axes["W"] = free_wx 
+                                #self.state.safe_axes["W"] = free_wx *-.625
                 payload = {
                     "type": "safety",
                     "yaw": float(yaw),
@@ -894,5 +911,6 @@ class SafetyModule:
                     "angle_bins": angle_bins,
                 }
 
+
                 await self.broadcast_safety(payload)
-                await asyncio.sleep(0.05)  # ~20 Hz
+                await asyncio.sleep(0.10)  # ~20 Hz

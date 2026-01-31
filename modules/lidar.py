@@ -37,8 +37,8 @@ class LidarModule:
 
         payload = {
             "type": "scan",
-            "angles": angles_rad,     # the angles you actually want to plot (you are using angles_filled)
-            "ranges": ranges_m,
+            "angles": angles_rad.tolist(),     # the angles you actually want to plot (you are using angles_filled)
+            "ranges": ranges_m.tolist(),
             "intensity": intensity,
             "range_max": config.LIDAR_MAX_RANGE,
             "clusters": clusters or [],   # [[[a1,a0],[r1,r0]], ...]
@@ -102,8 +102,8 @@ class LidarModule:
             return angles_rad, ranges_m, []
 
         order = np.argsort(np.asarray(angles_rad))
-        a = np.asarray(angles_rad, dtype=float)[order]
-        r = np.asarray(ranges_m, dtype=float)[order]
+        a = np.asarray(angles_rad, dtype=float)
+        r = np.asarray(ranges_m, dtype=float)
 
         angle_step = math.radians(angle_step_deg)
         max_fill_gap = math.radians(max_fill_gap_deg)
@@ -213,15 +213,16 @@ class LidarModule:
                     check_ranges_m = []
                     # -----------------------------------------------
 
-                    for a_deg, d_mm in zip(angles_deg, dists_mm):
-                        r_m = d_mm / 1000.0 # Converting for each distance
-                        if r_m <= 0.0 or r_m > config.LIDAR_MAX_RANGE:
-                            continue # Ends current iteration of the loop -> If we have a value <0 or greater than max range we skip
-                            # According to RPLIDAR it's 0 when the measurement is invalid.
+                    scan_np = np.asarray(scan, dtype=np.float32)   # shape (N,3): [intensity, angle_deg, dist_mm]
+                    angles_deg_all = scan_np[:, 1]
+                    dists_mm_all = scan_np[:, 2]
 
-                        a_rad = (math.radians(a_deg)) # The angle comes as a degree so we convert it to rads
-                        angles_rad.append(a_rad) # We append radian angle to angles_rad
-                        ranges_m.append(r_m) # We append the associated distance in meters
+                    ranges_m_all = dists_mm_all * 0.001
+                    mask = (ranges_m_all > 0.0) & (ranges_m_all <= config.LIDAR_MAX_RANGE)
+
+                    ranges_m = ranges_m_all[mask]
+                    angles_rad = np.deg2rad(angles_deg_all[mask])
+                    #intensity = intensity_all[mask]  
 
                     # --------- GAP FILL (added, minimal intrusion) ---------
                     # Fill missing intermediate angles/ranges for small gaps.
@@ -243,7 +244,7 @@ class LidarModule:
 
                     # This is the dictionary that holds a set of arrays that are indexed by <= 1.0 meters in distance. 
                     self.state.lidar_close = {"angles": angles_filled, "ranges": ranges_filled, "clusters":clusters, "yaw":yaw} # Using angles filled
-
+                    '''
                     if ranges_m and self.loop: # If ranges_m is not empty
                         # ---- broadcast attempt counter ----
                         with self._rate_lock:
@@ -254,15 +255,14 @@ class LidarModule:
                             self.broadcast_scan(angles_filled, ranges_filled, intensity, clusters=clusters, yaw=yaw),
                             self.loop
                         )
-
-
+                    '''
                         # Update state with the lidar payload for the broadcaster
-                        self.state.lidar_payload = {
+                    self.state.lidar_payload = {
                             "type": "scan",
-                            "angles": angles_rad, # using rad regular without any changes
-                            "ranges": ranges_m,
-                            "intensity": intensity,
-                            "range_max": config.LIDAR_MAX_RANGE,
+                            "angles": angles_rad.tolist(), # using rad regular without any changes
+                            "ranges": ranges_m.tolist(),
+                            #"intensity": intensity,
+                            "range_max": float(config.LIDAR_MAX_RANGE),
                         }
                     #print(clusters)
                     # Print rates roughly once per second

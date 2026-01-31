@@ -42,22 +42,19 @@ class Manual(BehaviorBase):
         # drive based on joystick
         x  = ctrl.state.safe_axes["LX"]
         y  = ctrl.state.safe_axes["LY"]
-        rx = ctrl.state.axes["RX"] * -1 # negative when sending to calculate with robot yaw function
-        ry = ctrl.state.axes["RY"]
-        yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
-        if ctrl.state.triggers["LT"] == 1:
-            angle = (np.arctan2(ry,rx)-np.pi/2) % (2*np.pi)
-        else:
-            angle = 0
-        w,val = ctrl.motors.calc_robot_yaw(angle,yaw)
-        if abs(w) <= 0.1:
-            w = 0 
-            #print(f"stick{angle:.2f}")
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx*-.65)
+        rx = ctrl.state.axes["RX"] # negative when sending to calculate with robot yaw function
+        wx = ctrl.state.safe_axes["W"]
+        yaw = np.deg2rad(ctrl.state.stm["yaw"])
+        w,val = ctrl.motors.calc_robot_yaw(wx,yaw)
+        #print(w,val,yaw,wx)
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx)
         #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
             })
+
+
+
 
 class Follower(BehaviorBase):
     name = "Follower"
@@ -76,8 +73,8 @@ class Follower(BehaviorBase):
         # follow logic here
         angle = ctrl.state.hunted["angle"] %(2*np.pi)
         distance = ctrl.state.hunted["distance"]
-        yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
-        if distance <= 1.5:
+        #yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
+        if distance <= 1.0:
             ctrl.motors.brake_all_motors(message_toggle=False)  # optional
             return
         w,val = ctrl.motors.calc_robot_yaw(0,angle)
@@ -93,13 +90,14 @@ class Follower(BehaviorBase):
             y = 0
         if abs(w) <= 0.040:
             w = 0 
-        ctrl.state.command_vector["x"] = x * .45
-        ctrl.state.command_vector["x"] = y * .45
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"],ctrl.state.safe_axes["LY"], w*.2)
-        print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
-        ctrl.motors.drive_all_wheels({
-                "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
-            })
+        ctrl.state.command_vector["x"] = x * .32
+        ctrl.state.command_vector["y"] = y * .32
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"],ctrl.state.safe_axes["LY"], w*.35)
+        #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
+        
+        #ctrl.motors.drive_all_wheels({
+        #        "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
+        #    })
 
 class Tag(BehaviorBase):
     name = "Tag"
@@ -164,10 +162,11 @@ class Tag(BehaviorBase):
                 if move == True:
                     try:
                         # need to fix this for collision avoidance
-                        ctrl.state.command_vector["LX"] = y *-1
-                        ctrl.state.command_vector["LY"] = x
+                        ctrl.state.command_vector["LX"] = y * -1.5
+                        ctrl.state.command_vector["LY"] = x * 1.5
+                        wx = ctrl.state.safe_axes["W"] * 0.5
                         print("Moving")
-                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"], ctrl.state.safe_axes["LY"], yaw*-.25)
+                        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"], ctrl.state.safe_axes["LY"], yaw*-.25 + wx)
                         ctrl.motors.drive_all_wheels({
                                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
                             })

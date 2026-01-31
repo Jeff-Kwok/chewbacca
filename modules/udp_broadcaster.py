@@ -32,7 +32,6 @@ class UdpBroadcaster:
                 
                 if self.state.stm_imu_payload:
                     message = json.dumps(self.state.stm_imu_payload).encode('utf-8')
-                    #print(message)
                     self.stm_imu_socket.sendto(message, self.stm_imu_address)
                 
                 if self.state.stm:

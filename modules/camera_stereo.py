@@ -220,7 +220,7 @@ class CameraStereo:
         results = self.model.predict(source=[left, right], imgsz=config.IMGSZ, conf=config.CONF, verbose=getattr(config, 'YOLO_VERBOSE', False))
         rL, rR = results
         objsL, objsR = self.process_pose(rL, "L"), self.process_pose(rR, "R")
-        self.draw_pose_debug(left, objsL), self.draw_pose_debug(right, objsR)
+        #self.draw_pose_debug(left, objsL), self.draw_pose_debug(right, objsR)
         if objsL and objsR:
             try:
                 z = float(self.stereo_depth(objsL[0]["cx"], objsR[0]["cx"], self.f, self.B))
@@ -301,8 +301,8 @@ class CameraStereo:
         self.consec_fail = 0
         
         h_full, w_full = frame.shape[:2]
-        left  = frame[:, :w_full//2].copy()
-        right = frame[:, w_full//2:].copy()
+        left  = frame[:, :w_full//2]       
+        right = frame[:, w_full//2:]
 
         payload = None
         if camera_mode == "Yolo":
@@ -319,5 +319,5 @@ class CameraStereo:
 
         cv2.putText(left, f"FPS: {self.fps:.1f}", (10, left.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        vis = np.hstack([left, right])
+        vis = left
         return vis, payload
