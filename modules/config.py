@@ -39,7 +39,7 @@ MAX_CONSEC_FAIL     = 10      # reopen after this many failed reads
 FIND_DEVICE_EVERY_N = 1       # re-scan devices each reconnect (1 = always)
 
 # YOLO behavior
-MODEL_PATH = "models/yolo11m-pose.pt"
+MODEL_PATH = "models/yolo11s-pose.pt"
 print(MODEL_PATH)
 IMGSZ      = 512
 TAG_SIZE_M = 0.166

@@ -35,13 +35,20 @@ class LidarModule:
         if not self.clients:
             return
 
+        # FIX: allow intensity=None and handle any array-like safely
+        if intensity is None:
+            intensity_out = []
+        else:
+            intensity_out = intensity.tolist() if hasattr(intensity, "tolist") else list(intensity)
+
+        # NOTE: keep clusters safe (avoid numpy truthiness issues)
         payload = {
             "type": "scan",
-            "angles": angles_rad.tolist(),     # the angles you actually want to plot (you are using angles_filled)
-            "ranges": ranges_m.tolist(),
-            "intensity": intensity,
+            "angles": angles_rad.tolist() if hasattr(angles_rad, "tolist") else list(angles_rad),
+            "ranges": ranges_m.tolist() if hasattr(ranges_m, "tolist") else list(ranges_m),
+            "intensity": intensity_out,
             "range_max": config.LIDAR_MAX_RANGE,
-            "clusters": clusters or [],   # [[[a1,a0],[r1,r0]], ...]
+            "clusters": clusters if clusters is not None else [],   # [[[a1,a0],[r1,r0]], ...]
             "yaw": float(yaw) if yaw is not None else None,
         }
 
@@ -51,7 +58,6 @@ class LidarModule:
                 await ws.send(msg)
             except Exception:
                 pass
-
 
     def _rate_tick(self):
         """Print intake/broadcast rates every ~1s."""
@@ -88,6 +94,7 @@ class LidarModule:
     def angle_diff(self, a, b):
         """Wrap-safe signed difference a-b in radians, in [-pi, pi]."""
         return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
     def fill_angle_gaps(self, angles_rad, ranges_m,
                         angle_step_deg=0.25,
                         max_fill_gap_deg=15.0, # gap between two angles no greater than 10
@@ -98,12 +105,16 @@ class LidarModule:
         clusters: stitched segments as endpoints only: [[[a_end,a_start],[r_end,r_start]], ...]
         """
 
-        if not angles_rad or len(angles_rad) != len(ranges_m) or len(angles_rad) < 2:
+        if (angles_rad is None) or (ranges_m is None) or (len(angles_rad) < 2) or (len(angles_rad) != len(ranges_m)):
             return angles_rad, ranges_m, []
 
-        order = np.argsort(np.asarray(angles_rad))
         a = np.asarray(angles_rad, dtype=float)
         r = np.asarray(ranges_m, dtype=float)
+
+        # IMPORTANT: sort angles AND carry ranges with them (you computed order before, but didn't apply)
+        order = np.argsort(a)
+        a = a[order]
+        r = r[order]
 
         angle_step = math.radians(angle_step_deg)
         max_fill_gap = math.radians(max_fill_gap_deg)
@@ -165,8 +176,6 @@ class LidarModule:
             else:
                 # continuity broke -> finalize any existing run
                 finalize_run()
-                # You may also want to start "single point" runs (usually no)
-                # run_active stays False
             # -----------------------------
 
         finalize_run()
@@ -202,18 +211,8 @@ class LidarModule:
                         self._rx_points += len(scan)
                     # -----------------------------------------------
 
-                    # -----------------------------------------------
-                    intensity = [m[0] for m in scan] # Raw Intensities
-                    angles_deg = [m[1] for m in scan] # Raw Angles degree 0,360
-                    dists_mm = [m[2] for m in scan] # Raw Distances in millimeter
-                    angles_rad = []
-                    angles_ros = []
-                    ranges_m = []
-                    check_angles_rad = []
-                    check_ranges_m = []
-                    # -----------------------------------------------
-
                     scan_np = np.asarray(scan, dtype=np.float32)   # shape (N,3): [intensity, angle_deg, dist_mm]
+                    intensity_all = scan_np[:, 0]
                     angles_deg_all = scan_np[:, 1]
                     dists_mm_all = scan_np[:, 2]
 
@@ -222,14 +221,16 @@ class LidarModule:
 
                     ranges_m = ranges_m_all[mask]
                     angles_rad = np.deg2rad(angles_deg_all[mask])
-                    #intensity = intensity_all[mask]  
+
+                    # IMPORTANT: intensity must match mask length to avoid descriptor length mismatch
+                    intensity = intensity_all[mask]
 
                     # --------- GAP FILL (added, minimal intrusion) ---------
-                    # Fill missing intermediate angles/ranges for small gaps.
                     yaw = np.deg2rad(float(self.state.stm["yaw"]))
                     angles = (np.asarray(angles_rad, dtype=float) + yaw) % (2*np.pi)
-                    angles_out = ((angles) % (2*np.pi)).tolist()
-                    angles_filled, ranges_filled,clusters = self.fill_angle_gaps(
+                    angles_out = (angles % (2*np.pi)).tolist()
+
+                    angles_filled, ranges_filled, clusters = self.fill_angle_gaps(
                         angles_out,
                         ranges_m,
                         angle_step_deg=0.5,      # insert every 0.5°
@@ -238,35 +239,36 @@ class LidarModule:
                     )
                     # -------------------------------------------------------
 
-                    # The result of this loop are 2 sets of arrays where the values exclude non-conforming values.
-                    # The first set of arrays is indexed by a subset of angles that are nonzero in distance.
-                    # The second set of arrays is indexed by a subset of angles that are <= 1.0 meters in distance.
+                    self.state.lidar_close = {
+                        "angles": angles_filled,
+                        "ranges": ranges_filled,
+                        "clusters": clusters,
+                        "yaw": yaw
+                    }
 
-                    # This is the dictionary that holds a set of arrays that are indexed by <= 1.0 meters in distance. 
-                    self.state.lidar_close = {"angles": angles_filled, "ranges": ranges_filled, "clusters":clusters, "yaw":yaw} # Using angles filled
-                    '''
-                    if ranges_m and self.loop: # If ranges_m is not empty
-                        # ---- broadcast attempt counter ----
+                    # FIX: numpy array truthiness => use size (and avoid intensity-length mismatch vs filled arrays)
+                    if (hasattr(ranges_m, "size") and ranges_m.size > 0) and self.loop:
                         with self._rate_lock:
                             self._tx_scans += 1
-                        # -----------------------------------
 
                         asyncio.run_coroutine_threadsafe(
-                            self.broadcast_scan(angles_filled, ranges_filled, intensity, clusters=clusters, yaw=yaw),
+                            self.broadcast_scan(
+                                np.asarray(angles_filled, dtype=float),
+                                np.asarray(ranges_filled, dtype=float),
+                                None,  # FIX: filled points don't have matching intensity; avoid mismatch
+                                clusters=clusters,
+                                yaw=yaw
+                            ),
                             self.loop
                         )
-                    '''
-                        # Update state with the lidar payload for the broadcaster
+
+                    # keep your original payload (raw masked arrays)
                     self.state.lidar_payload = {
-                            "type": "scan",
-                            "angles": angles_rad.tolist(), # using rad regular without any changes
-                            "ranges": ranges_m.tolist(),
-                            #"intensity": intensity,
-                            "range_max": float(config.LIDAR_MAX_RANGE),
-                        }
-                    #print(clusters)
-                    # Print rates roughly once per second
-                    #self._rate_tick()
+                        "type": "scan",
+                        "angles": angles_rad.tolist(),
+                        "ranges": ranges_m.tolist(),
+                        "range_max": float(config.LIDAR_MAX_RANGE),
+                    }
 
             except Exception as e:
                 print(f"[LIDAR] Error: {e}. Retrying in 5 seconds...")
