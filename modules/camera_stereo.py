@@ -58,6 +58,34 @@ class CameraStereo:
         # Create the detector ONCE (don’t create/destroy repeatedly)
         self._init_apriltag_detector()
 
+        # Resolve MODEL_PATH robustly (engine in same folder as this file or cwd)
+        self._resolved_model_path = self._resolve_model_path(getattr(config, "MODEL_PATH", ""))
+
+        # NEW: last yolo readouts for overlay
+        self._last_yolo_z = None
+        self._last_yolo_angle = None
+
+    # robust path resolver (keeps behavior same; just prevents "file not found" + wrong cwd issues)
+    def _resolve_model_path(self, model_path: str) -> str:
+        if not model_path:
+            return model_path
+
+        # If already absolute and exists, keep it
+        if os.path.isabs(model_path) and os.path.exists(model_path):
+            return model_path
+
+        # Try relative to this script's directory
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            cand = os.path.join(here, model_path)
+            if os.path.exists(cand):
+                return cand
+        except Exception:
+            pass
+
+        # Fallback to as-given (maybe caller sets cwd correctly)
+        return model_path
+
     # ---------- CAMERA ----------
     def find_camera_device(self, prefer_substr: str | None = None) -> str | None:
         by_id = sorted(glob.glob("/dev/v4l/by-id/*"))
@@ -198,7 +226,8 @@ class CameraStereo:
             def valid(idx):
                 return conf[i, idx] > getattr(config, 'YOLO_KPT_CONF', 0.3) if conf is not None else np.isfinite(pts[idx]).all()
             ang = None
-            if valid(LSH) and valid(RSH): ang = math.atan2(pts[RSH][1] - pts[LSH][1], pts[RSH][0] - pts[LSH][0])
+            if valid(LSH) and valid(RSH):
+                ang = math.atan2(pts[RSH][1] - pts[LSH][1], pts[RSH][0] - pts[LSH][0])
             out.append({"cx": cx, "cy": cy, "ang": ang, "cls": int(clss[i])})
         return out
 
@@ -212,22 +241,123 @@ class CameraStereo:
                 y2 = int(cy + L * np.sin(o["ang"]))
                 cv2.arrowedLine(frame, (cx, cy), (x2, y2), color, 2)
 
+    # Draw raw YOLO keypoints/skeleton directly from Results (r)
+    def draw_pose_kpts(self, frame, r, kpt_thr=None, color_pts=(0, 0, 255), color_lines=(0, 255, 255)):
+        """
+        Draws the detected human pose keypoints (and a light skeleton) from Ultralytics Results.
+        Minimal: draws only the FIRST detection to match max_det=1.
+        """
+        if kpt_thr is None:
+            kpt_thr = float(getattr(config, "YOLO_KPT_CONF", 0.3))
+
+        if r is None or r.keypoints is None or len(r.keypoints) == 0:
+            return
+
+        # First detection only (fast + matches max_det=1)
+        pts = r.keypoints.xy[0].cpu().numpy()  # (K, 2)
+        conf = None
+        if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None:
+            conf = r.keypoints.conf[0].cpu().numpy()  # (K,)
+
+        def ok(i):
+            return True if conf is None else (conf[i] >= kpt_thr)
+
+        # Draw keypoints
+        for i in range(pts.shape[0]):
+            x, y = pts[i]
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            if not ok(i):
+                continue
+            cv2.circle(frame, (int(x), int(y)), 3, color_pts, -1)
+
+        # Draw a simple skeleton if it looks like COCO-17
+        if pts.shape[0] >= 17:
+            pairs = [
+                (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+                (5, 11), (6, 12), (11, 12),
+                (11, 13), (13, 15), (12, 14), (14, 16),
+                (0, 1), (0, 2), (1, 3), (2, 4)
+            ]
+            for a, b in pairs:
+                if a >= pts.shape[0] or b >= pts.shape[0]:
+                    continue
+                if not (ok(a) and ok(b)):
+                    continue
+                xa, ya = pts[a]
+                xb, yb = pts[b]
+                if not (np.isfinite(xa) and np.isfinite(ya) and np.isfinite(xb) and np.isfinite(yb)):
+                    continue
+                cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), color_lines, 2)
+
+    # NEW: overlay text helper
+    def _overlay_text(self, frame, lines, org=(10, 30), line_h=26):
+        x, y = org
+        for s in lines:
+            cv2.putText(frame, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            y += line_h
+
     # ---------- MODES ----------
     def _run_hunting(self, left, right):
         if self.model is None:
             print("[CAM] Initializing YOLO model...")
-            self.model = YOLO(config.MODEL_PATH)
-        results = self.model.predict(source=[left, right], imgsz=config.IMGSZ, conf=config.CONF, verbose=getattr(config, 'YOLO_VERBOSE', False))
-        rL, rR = results
-        objsL, objsR = self.process_pose(rL, "L"), self.process_pose(rR, "R")
-        #self.draw_pose_debug(left, objsL), self.draw_pose_debug(right, objsR)
+            self.model = YOLO(self._resolved_model_path)
+            print(f"[CAM] YOLO model loaded: {self._resolved_model_path}")
+
+        # --- batch=1 SAFE PATH ---
+        rL = self.model.predict(
+            source=left,
+            imgsz=config.IMGSZ,
+            conf=config.CONF,
+            device=0,
+            max_det=1,
+            verbose=False
+        )[0]
+
+        rR = self.model.predict(
+            source=right,
+            imgsz=config.IMGSZ,
+            conf=config.CONF,
+            device=0,
+            max_det=1,
+            verbose=False
+        )[0]
+
+        objsL = self.process_pose(rL, "L")
+        objsR = self.process_pose(rR, "R")
+
+        # Draw pose on LEFT
+        self.draw_pose_kpts(left, rL)
+
+        # Compute + overlay distance/angle if possible
+        z = None
+        angle = None
         if objsL and objsR:
             try:
                 z = float(self.stereo_depth(objsL[0]["cx"], objsR[0]["cx"], self.f, self.B))
-                angle = np.arctan((config.CAMERA_CENTER_X / 2 - objsL[0]["cx"]) / self.f * 3)
-                return build_vision_payload(objsL[0]["cx"], objsL[0]["cy"], objsL[0]["cls"], z, angle)
+                angle = float(np.arctan((config.CAMERA_CENTER_X / 2 - objsL[0]["cx"]) / self.f * 3))
             except Exception as e:
                 print(e)
+
+        # Cache for overlay even if payload isn't returned
+        self._last_yolo_z = z
+        self._last_yolo_angle = angle
+
+        # Overlay (only in YOLO mode)
+        lines = ["MODE: YOLO"]
+        if z is not None:
+            lines.append(f"Dist: {z:.2f}")
+        else:
+            lines.append("Dist: --")
+        if angle is not None:
+            lines.append(f"Angle: {angle:+.3f} rad")
+        else:
+            lines.append("Angle: --")
+        self._overlay_text(left, lines, org=(10, 30))
+
+        if objsL and objsR and (z is not None) and (angle is not None):
+            return build_vision_payload(objsL[0]["cx"], objsL[0]["cy"], objsL[0]["cls"], z, angle)
+
         return None
 
     def _run_tagging(self, left, right):
@@ -242,28 +372,21 @@ class CameraStereo:
                 self._init_apriltag_detector()
             return None
 
-        
         matched = self.match_by_id(left_info, right_info)
         self.draw_tag_debug(left, left_info), self.draw_tag_debug(right, right_info)
-        
+
         for tag_id, (L, R) in matched.items():
-            # Has all information of the seen id use matched
             cx_left = L["center"][0]
             cx_right = R["center"][0]
-            # Calculate depth from stereo disparity
             z_m = self.stereo_depth(cx_left, cx_right, self.f, self.B)
 
             if z_m is not None:
-                z_mm = z_m * 1000.0  # Convert to mm
-                
-                # We can still get angle from the monocular pose of the left camera
                 angle = None
                 if L["t"] is not None:
                     t = L["t"].reshape(-1)
                     angle = math.atan2(-float(t[0]), float(t[2]))
-                    #print(L["t"])
                 corners = L.get("corners")
-                return build_vision_payload(L["center"][0], L["center"][1], tag_id,t[2], angle, corners)
+                return build_vision_payload(L["center"][0], L["center"][1], tag_id, float(t[2]), angle, corners)
         return None
 
     def _run_idle(self, left, right):
@@ -297,11 +420,11 @@ class CameraStereo:
             else:
                 time.sleep(0.02)
             return None, None
-        
+
         self.consec_fail = 0
-        
+
         h_full, w_full = frame.shape[:2]
-        left  = frame[:, :w_full//2]       
+        left  = frame[:, :w_full//2]
         right = frame[:, w_full//2:]
 
         payload = None
@@ -309,15 +432,17 @@ class CameraStereo:
             payload = self._run_hunting(left, right)
         elif camera_mode == "AprilTag":
             payload = self._run_tagging(left, right)
-        else: # Rest
+        else:  # Rest
             payload = self._run_idle(left, right)
 
         now = time.time()
         dt = now - self.last_t
         self.last_t = now
-        if dt > 0: self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
+        if dt > 0:
+            self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
 
-        cv2.putText(left, f"FPS: {self.fps:.1f}", (10, left.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
+        cv2.putText(left, f"FPS: {self.fps:.1f}", (10, left.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         vis = left
         return vis, payload

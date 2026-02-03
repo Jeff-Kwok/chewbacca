@@ -40,14 +40,14 @@ class Manual(BehaviorBase):
         ctrl.motors.brake_all_motors(message_toggle=False)
     def hunt(self, ctrl, dt):
         # drive based on joystick
-        x  = ctrl.state.safe_axes["LX"]
-        y  = ctrl.state.safe_axes["LY"]
+        x  = ctrl.state.safe_axes["LX"] * .80
+        y  = ctrl.state.safe_axes["LY"] * .80
         rx = ctrl.state.axes["RX"] # negative when sending to calculate with robot yaw function
         wx = ctrl.state.safe_axes["W"]
         yaw = np.deg2rad(ctrl.state.stm["yaw"])
         w,val = ctrl.motors.calc_robot_yaw(wx,yaw)
         #print(w,val,yaw,wx)
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx)
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x, y, rx*.250)
         #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
         ctrl.motors.drive_all_wheels({
                 "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,

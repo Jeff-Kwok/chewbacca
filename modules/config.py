@@ -39,9 +39,9 @@ MAX_CONSEC_FAIL     = 10      # reopen after this many failed reads
 FIND_DEVICE_EVERY_N = 1       # re-scan devices each reconnect (1 = always)
 
 # YOLO behavior
-MODEL_PATH = "models/yolo11s-pose.pt"
+MODEL_PATH = "models/yolo11s-pose.engine"
 print(MODEL_PATH)
-IMGSZ      = 512
+IMGSZ      =640
 TAG_SIZE_M = 0.166
 CONF       = 0.35
 STEREO_FOCAL_LENGTH = 700*(1/2.3) # pixels

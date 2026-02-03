@@ -78,14 +78,14 @@ class SafetyModule:
 
         # ---- NEW: Repulsion zone parameters (5.0 -> 1.5 -> 0.0) ----
         # We keep zone_radius as the "hard" radius (1.5m) for include_by_zone.
-        self.zone_outer_radius = 1.2      # meters (soft influence begins)
-        self.zone_inner_radius = 0.60      # meters (hard influence boundary)
+        self.zone_outer_radius = 2.0      # meters (soft influence begins)
+        self.zone_inner_radius = 0.30      # meters (hard influence boundary)
 
         # Repulsion scale factors (negative = repel)
         # 5.0 -> 1.5 : contributes toward -1.0
         # 1.5 -> 0.0 : contributes toward -2.0
-        self.repulse_outer_gain = 0.75
-        self.repulse_inner_gain = 1.5
+        self.repulse_outer_gain = 1.1
+        self.repulse_inner_gain = 1.35
 
         # ---- Free-space interval requirements ----
         self.min_free_interval_deg = 8.5
@@ -823,7 +823,46 @@ class SafetyModule:
                 # repulse_x, repulse_y are WORLD frame (unit)
                 # yaw is robot heading in world
                 repulse_wx, repulse_wy = self.repulsion_against_intended(hits, intended_angle, lx, ly)
-
+                s = np.cos(yaw)
+                c = np.sin(yaw)
+                repulse_wx_corrected = (c*repulse_wx*-1 + s*repulse_wy)  
+                repulse_wy_corrected = (s*repulse_wx + c*repulse_wy)
+                
+                # controller input  = repulse_wx + lx
+                # 3) WORLD free-space vector (only if ok)
+                free_wx = 0.0
+                free_wy = 0.0
+                free_wdy = 0.0
+                free_wdx = 0.0
+                if free.get("ok") and free.get("span", 0.0) > 0.25:
+                    #span_norm = np.clip(free["span_deg"] / 45.0, 0.0, 1.0)  # 0..1
+                    #w = np.log1p(9.0 * span_norm) / np.log1p(9.0)          # 0..1
+                    # free["mid"] is a WORLD angle -> use cos/sin
+                    #print(f"w: {w:.2f}")
+                    #free["mid"] = (free["mid"] +np.pi/2) % (2*np.pi)
+                    #print(self.angle_diff(intended_angle,free["mid"]))
+                    free_wx = ((intended_angle - free["mid"]))%(2*np.pi)
+                    free_wdx = s*np.cos(free_wx) + -c*np.sin(free_wx)
+                    free_wdy = c*np.sin(free_wx) + s*np.sin(free_wx)
+                    #print(free_wdx,free_wdy)
+                #print(f"free: {free['mid']:.2f} yaw: {yaw:.2f} intended: {intended_angle:.2f}") # We can take free_wx as our rtational vector
+                # 4) Combine in WORLD (this is the correct place)
+                kR = .80   # repulsion strength
+                kF = 0.32   # free-space strength (tune)
+                # 5) WORLD -> ROBOT for controller axes
+                lx_corr =  repulse_wx_corrected * kR + lx*.60 
+                ly_corr =  repulse_wy_corrected * kR + ly *.60
+                # 6) Your convention angle (robot frame)
+                corrected_angle = self.angle_wrap(np.arctan2(ly_corr, lx_corr))
+                #print(
+                    #f"repulse_w ({repulse_wx:.2f},{repulse_wy:.2f}) "
+                    #f"repulse_w_corrected ({repulse_wx_corrected:.2f},{repulse_wy_corrected:.2f},{free_wx:.2f} ) "
+                    #f"yaw: {yaw:.2f} | cos: {c:.2f} sin: {s:.2f} angle: {np.arctan2(repulse_wy,repulse_wx):.2f}"
+                #)
+                self.state.safe_axes["LX"] = lx_corr
+                self.state.safe_axes["LY"] = ly_corr
+                self.state.safe_axes["W"] = free_wx 
+                                #self.state.safe_axes["W"] = free_wx *-.625
                 # NOTE: no control outputs are produced anymore.
                 # This module only broadcasts a payload for your websocket visualizer.
 
