@@ -78,14 +78,14 @@ class SafetyModule:
 
         # ---- NEW: Repulsion zone parameters (5.0 -> 1.5 -> 0.0) ----
         # We keep zone_radius as the "hard" radius (1.5m) for include_by_zone.
-        self.zone_outer_radius = 2.0      # meters (soft influence begins)
-        self.zone_inner_radius = 0.30      # meters (hard influence boundary)
+        self.zone_outer_radius = 1.75      # meters (soft influence begins)
+        self.zone_inner_radius = 0.45      # meters (hard influence boundary)
 
         # Repulsion scale factors (negative = repel)
         # 5.0 -> 1.5 : contributes toward -1.0
         # 1.5 -> 0.0 : contributes toward -2.0
-        self.repulse_outer_gain = 1.1
-        self.repulse_inner_gain = 1.35
+        self.repulse_outer_gain = 1.2
+        self.repulse_inner_gain = 1.15
 
         # ---- Free-space interval requirements ----
         self.min_free_interval_deg = 8.5
@@ -801,6 +801,7 @@ class SafetyModule:
                     hits.append(hit)
 
                 # 6) Build 0..2pi "number-line" bins using GEOMETRY points
+                '''
                 n_bins = 36
                 angle_bins = self.build_angle_bins(
                     hits,
@@ -819,7 +820,7 @@ class SafetyModule:
                     min_span_deg=float(self.min_free_interval_deg),
                     clear_r=float(self.clear_radius),
                 )
-
+                '''
                 # repulse_x, repulse_y are WORLD frame (unit)
                 # yaw is robot heading in world
                 repulse_wx, repulse_wy = self.repulsion_against_intended(hits, intended_angle, lx, ly)
@@ -829,6 +830,7 @@ class SafetyModule:
                 repulse_wy_corrected = (s*repulse_wx + c*repulse_wy)
                 
                 # controller input  = repulse_wx + lx
+                '''
                 # 3) WORLD free-space vector (only if ok)
                 free_wx = 0.0
                 free_wy = 0.0
@@ -847,6 +849,7 @@ class SafetyModule:
                     #print(free_wdx,free_wdy)
                 #print(f"free: {free['mid']:.2f} yaw: {yaw:.2f} intended: {intended_angle:.2f}") # We can take free_wx as our rtational vector
                 # 4) Combine in WORLD (this is the correct place)
+                '''
                 kR = .80   # repulsion strength
                 kF = 0.32   # free-space strength (tune)
                 # 5) WORLD -> ROBOT for controller axes
@@ -861,11 +864,11 @@ class SafetyModule:
                 #)
                 self.state.safe_axes["LX"] = lx_corr
                 self.state.safe_axes["LY"] = ly_corr
-                self.state.safe_axes["W"] = free_wx 
+                #self.state.safe_axes["W"] = free_wx 
                                 #self.state.safe_axes["W"] = free_wx *-.625
                 # NOTE: no control outputs are produced anymore.
                 # This module only broadcasts a payload for your websocket visualizer.
-
+                '''
                 payload = {
                     "type": "safety",
                     "yaw": float(yaw),
@@ -875,7 +878,7 @@ class SafetyModule:
                     "intended_angle": float(intended_angle),
                     "intended_vector": intended_vector,
                     "intended_magnitude": float(intended_magnitude),
-                    "intended_bin_i": int(self.bin_index_for_angle(intended_angle, n_bins)),
+                    #"intended_bin_i": int(self.bin_index_for_angle(intended_angle, n_bins)),
 
                     # repulsion debug
                     "repulsion": {
@@ -888,9 +891,9 @@ class SafetyModule:
                     },
 
                     # free-space debug
-                    "free_interval": free,
-                    "min_free_interval_deg": float(self.min_free_interval_deg),
-                    "clear_radius": float(self.clear_radius),
+                    #"free_interval": free,
+                    #"min_free_interval_deg": float(self.min_free_interval_deg),
+                    #"clear_radius": float(self.clear_radius),
 
                     # filters / params
                     "visible_arc_deg": float(self.visible_arc_deg),
@@ -906,8 +909,9 @@ class SafetyModule:
 
                     # hits + bins
                     "intended_hits": hits,
-                    "angle_bins": angle_bins,
+                    #"angle_bins": angle_bins,
                 }
 
                 await self.broadcast_safety(payload)
-                await asyncio.sleep(0.05)  # ~20 Hz
+                '''
+                await asyncio.sleep(0.10)  # ~20 Hz

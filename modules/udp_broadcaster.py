@@ -33,11 +33,11 @@ class UdpBroadcaster:
                 if self.state.stm_imu_payload:
                     message = json.dumps(self.state.stm_imu_payload).encode('utf-8')
                     self.stm_imu_socket.sendto(message, self.stm_imu_address)
-                
+                '''
                 if self.state.stm:
                     message = json.dumps(self.state.stm).encode('utf-8')
                     self.stm_generic_socket.sendto(message, self.stm_generic_address)
-
+                '''
                 await asyncio.sleep(1.0 / config.UDP_BROADCASTER_HZ)
             except Exception as e:
                 print(f"[UDP Broadcaster] Error: {e}")

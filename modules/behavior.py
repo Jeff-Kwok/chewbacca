@@ -68,36 +68,82 @@ class Follower(BehaviorBase):
         ctrl.state.tag_behavior_toggle = 0
         ctrl.state.tag_behavior_current = 0
         print(ctrl.state.camera_modes[ctrl.state.camera_current])
-
     def hunt(self, ctrl, dt):
-        # follow logic here
-        angle = ctrl.state.hunted["angle"] %(2*np.pi)
+        angle = ctrl.state.hunted["angle"]
         distance = ctrl.state.hunted["distance"]
-        #yaw = (np.deg2rad(ctrl.state.stm["yaw"])-np.pi/2) % (2*np.pi)
-        if distance <= 1.0:
-            ctrl.motors.brake_all_motors(message_toggle=False)  # optional
+
+        # ---------- NEW: stale detection based on repeated outputs ----------
+        # init persistent memory once
+        if not hasattr(self, "_h_last_sig"):
+            self._h_last_sig = None
+            self._h_stale_t = 0.0
+
+        # signature of the detection (quantized to ignore tiny jitter)
+        sig = (
+            round(float(angle), 3),
+            round(float(distance), 3),
+            # If you have center too, include it (best):
+            # round(float(ctrl.state.hunted["center"][0]), 1),
+            # round(float(ctrl.state.hunted["center"][1]), 1),
+        )
+
+        if sig == self._h_last_sig:
+            self._h_stale_t += float(dt)
+        else:
+            self._h_last_sig = sig
+            self._h_stale_t = 0.0
+
+        stale_time = self._h_stale_t
+
+        # decay based on stale_time (not ts)
+        stale_start = 0.08  # seconds until decay begins
+        tau = 0.12           # seconds, time constant
+        min_decay = 0.25
+
+        if stale_time <= stale_start:
+            decay = 1.0
+        else:
+            decay = float(np.exp(-(stale_time - stale_start) / max(1e-6, tau)))
+            decay = max(min_decay, decay)
+        # -------------------------------------------------------------------
+
+        # yaw = ...
+        if distance <= 0.5:
+            ctrl.motors.brake_all_motors(message_toggle=False)
             return
-        w,val = ctrl.motors.calc_robot_yaw(0,angle)
-        w = w * 2.0
-        w = np.sign(w)*(abs(w)**1.2)
-        w = np.clip(w/0.8, -1.0,1.0)
-        # This math is lowkey stupid asf need to revamp this.
-        x = np.clip(np.sin(angle)*distance*-0.5,-1.0,1.0)
-        if abs(x) <= 0.2:
+
+        if abs(angle) < 0.2:
+            angle = 0
+        #print(distance)
+        y = np.log(distance/1000 + 0.3) * 0.5
+        w, val = ctrl.motors.calc_robot_yaw(0, angle)
+
+        w = np.sign(w) * ((abs(w) + 0.625) ** 4.4)
+
+        # apply decay BEFORE clip
+        w *= decay
+        w = np.clip(w, -0.215, 0.215)
+        x = -np.sin(angle)
+        x *= decay
+        x = np.clip(x,-0.25,0.25)
+        if abs(x) <= 0.1650:
             x = 0
-        y = np.clip(np.cos(angle)*distance*0.5,-1.0,1.0)
-        if abs(y) <= 0.2:
-            y = 0
-        if abs(w) <= 0.040:
-            w = 0 
-        ctrl.state.command_vector["x"] = x * .32
-        ctrl.state.command_vector["y"] = y * .32
-        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(ctrl.state.safe_axes["LX"],ctrl.state.safe_axes["LY"], w*.35)
-        #print(f"yaw: {yaw:.2f} angle: {angle:.2f}:.2f val: {val:.2f}:.2f w: {w:.2f}\n")
-        
-        #ctrl.motors.drive_all_wheels({
-        #        "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
-        #    })
+
+        if abs(w) <= 0.1650:
+            w = 0
+
+        ctrl.state.command_vector["LX"] = x
+        ctrl.state.command_vector["LY"] = y 
+        #x = ctrl.state.safe_axes["LX"] 
+        #y = ctrl.state.safe_axes["LY"] 
+        #print(x, y, angle, w, "stale:", stale_time, "decay:", decay)
+       # print(f"y: {y:.2f}")
+        w_fl, w_fr, w_rl, w_rr = ctrl.motors.calc_norm_vector(x*.60,y*0.85, w*0.55)
+        ctrl.motors.drive_all_wheels({
+            "nfr": w_fr, "nfl": w_fl, "nrr": w_rr, "nrl": w_rl,
+        })
+
+
 
 class Tag(BehaviorBase):
     name = "Tag"

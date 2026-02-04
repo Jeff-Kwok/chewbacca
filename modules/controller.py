@@ -5,17 +5,21 @@ import json
 from . import config
 from .utils import parse_payload
 
+
 class ControllerModule:
     def __init__(self, sock, state):
         self.sock = sock
         self.state = state
-        self.last_button3 = 0 
+        self.last_button3 = 0
         self.last_lb = 0
         self.last_rb = 0
         self.last_mode = 0
         self._last_dpad_down = 0
         self.last_button4 = 0
 
+        # --- NEW: packet de-dup to avoid re-parsing identical spam packets ---
+        self._last_packet = None
+        # -------------------------------------------------------------------
 
     def select_frame(self, leftTrigger, rightTrigger, toggle):
         # Mode shifting from ["Rest","Manual","Follower","Tag"]
@@ -35,6 +39,13 @@ class ControllerModule:
 
         while True:
             data = await loop.sock_recv(self.sock, 1024)
+
+            # --- NEW: skip identical packets (common when sticks are idle) ---
+            if data == self._last_packet:
+                continue
+            self._last_packet = data
+            # ---------------------------------------------------------------
+
             msg = data.decode("ascii", errors="ignore")
 
             axes, triggers, buttons = parse_payload(msg)
@@ -45,7 +56,6 @@ class ControllerModule:
             self.state.triggers = triggers
             self.state.buttons = buttons
             self.state.last_joy_time = time.monotonic()
-
 
             # Robot Mode Cycler -> To go to new modes press RB and LB, toggle will always set to be off when transitioning to a new mode
             lb = buttons["LB"]
@@ -67,7 +77,6 @@ class ControllerModule:
                     self.state.toggle = 0
                     print(self.state.robot_modes[self.state.robot_current])
 
-
             self.last_lb = lb
             self.last_rb = rb
 
@@ -77,12 +86,13 @@ class ControllerModule:
                 print(f"Toggle: {self.state.toggle}")
             self.last_button3 = toggle
 
-
-            if self.state.robot_modes[self.state.robot_current] == "Tag" and self.state.toggle ==1:
+            if self.state.robot_modes[self.state.robot_current] == "Tag" and self.state.toggle == 1:
                 autonomy_toggle = buttons["B"]
                 if autonomy_toggle == 1 and self.last_button4 == 0:
                     self.state.tag_behavior_toggle ^= 1
                     print(f"Autonomy Toggle: {self.state.tag_behavior_toggle}")
                 self.last_button4 = autonomy_toggle
             else:
-                 pass
+                # --- NEW: prevent sticky edge-detect when leaving/re-entering Tag ---
+                self.last_button4 = 0
+                # ---------------------------------------------------------------

@@ -10,6 +10,7 @@ import math
 import numpy as np
 import gc
 import torch
+import subprocess
 
 try:
     from . import config
@@ -27,54 +28,75 @@ def build_vision_payload(cx, cy, cls, z, angle, corners=None):
         "angle": float(angle) if angle is not None else 0.0,
         "ts": time.time()
     }
-    # Optional: include tag corners if provided
     if corners is not None:
         payload["corners"] = [[float(x), float(y)] for (x, y) in corners]
     return payload
 
 
 class CameraStereo:
+    """
+    UPDATED (per request):
+      - ONLY runs YOLO when camera_mode == "Yolo"
+      - ONLY runs AprilTag when camera_mode == "AprilTag"
+      - REST/other modes do NOT run either pipeline
+      - Pipelines are lazy-initialized and (optionally) torn down on mode switches
+      - Keeps your naming conventions and existing structure; changes are minimal and targeted
+    """
     def __init__(self, state):
-        # Reduce CPU thread thrash (important when mixing OpenCV + native libs)
         cv2.setNumThreads(1)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-        self.model = None
-        self.at_detector = None
-        self.at_detector_bad = False   # if we detect crashes, we can re-init once
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
 
+        self.state = state
+
+        # Camera
         self.cap = None
         self.device = None
         self.consec_fail = 0
         self.last_t = time.time()
         self.fps = 0.0
+
+        # Stereo params
         self.f = config.STEREO_FOCAL_LENGTH
         self.B = config.STEREO_BASELINE
-        self.state = state
 
-        # Create the detector ONCE (don’t create/destroy repeatedly)
-        self._init_apriltag_detector()
+        # Pipelines (LAZY INIT)
+        self.model = None
+        self.at_detector = None
+        self.at_detector_bad = False
 
-        # Resolve MODEL_PATH robustly (engine in same folder as this file or cwd)
-        self._resolved_model_path = self._resolve_model_path(getattr(config, "MODEL_PATH", ""))
+        # Track last mode so we can unload inactive pipeline
+        self._last_mode = None
 
-        # NEW: last yolo readouts for overlay
+        # Model path
+        default_engine = "yolo11n-pose.engine"
+        model_path = getattr(config, "MODEL_PATH", default_engine) or default_engine
+        self._resolved_model_path = self._resolve_model_path(model_path)
+
+        # YOLO settings
+        self._yolo_imgsz = 320
+        self._yolo_conf = float(getattr(config, "CONF", 0.50))
+        self._yolo_kpt_conf = float(getattr(config, "YOLO_KPT_CONF", 0.30))
+        self._yolo_max_det = int(getattr(config, "YOLO_MAX_DET", 2))
+
         self._last_yolo_z = None
         self._last_yolo_angle = None
 
-    # robust path resolver (keeps behavior same; just prevents "file not found" + wrong cwd issues)
     def _resolve_model_path(self, model_path: str) -> str:
         if not model_path:
             return model_path
 
-        # If already absolute and exists, keep it
         if os.path.isabs(model_path) and os.path.exists(model_path):
             return model_path
 
-        # Try relative to this script's directory
         try:
             here = os.path.dirname(os.path.abspath(__file__))
             cand = os.path.join(here, model_path)
@@ -83,7 +105,6 @@ class CameraStereo:
         except Exception:
             pass
 
-        # Fallback to as-given (maybe caller sets cwd correctly)
         return model_path
 
     # ---------- CAMERA ----------
@@ -103,21 +124,86 @@ class CameraStereo:
         videos = sorted(glob.glob("/dev/video*"))
         return videos[0] if videos else None
 
-    def open_camera(self, device: str, width: int, height: int) -> cv2.VideoCapture | None:
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    def _force_v4l2_mode(self, device: str, width: int, height: int, fps: int, pixfmt: str):
+        """
+        Force mode via v4l2-ctl (OpenCV sometimes ignores FPS/pixfmt).
+        """
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", device, f"--set-fmt-video=width={width},height={height},pixelformat={pixfmt}"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            subprocess.run(
+                ["v4l2-ctl", "-d", device, f"--set-parm={fps}"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
 
+    def open_camera(self, device: str, width: int, height: int) -> cv2.VideoCapture | None:
+        """
+        Match your fast standalone path: MJPG 640x240 @ 120.
+        """
+        self._force_v4l2_mode(device=device, width=640, height=240, fps=120, pixfmt="MJPG")
+
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
             return None
+
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        cap.set(cv2.CAP_PROP_FPS, 120)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = "".join([chr((fourcc >> 8*i) & 0xFF) for i in range(4)])
+        print(f"[CAM] negotiated: {w}x{h} fps:{fps} fourcc:{fourcc_str}")
+
         return cap
 
     def release_camera(self):
         if self.cap is not None:
             self.cap.release()
         self.cap = None
+
+    # ---------- PIPELINE LIFECYCLE ----------
+    def _ensure_mode(self, camera_mode: str):
+        """
+        Ensure ONLY the pipeline for the active mode exists.
+        Prevents AprilTag from running/competing while YOLO is active (and vice versa).
+        """
+        if camera_mode == self._last_mode:
+            return
+
+        # Switching modes: drop anything not needed
+        if camera_mode == "Yolo":
+            # drop AprilTag
+            if self.at_detector is not None:
+                self.at_detector = None
+                gc.collect()
+            self.at_detector_bad = False
+
+        elif camera_mode == "AprilTag":
+            # drop YOLO
+            if self.model is not None:
+                self.model = None
+                gc.collect()
+
+        else:
+            # Rest/other: drop both
+            if self.model is not None:
+                self.model = None
+            if self.at_detector is not None:
+                self.at_detector = None
+            self.at_detector_bad = False
+            gc.collect()
+
+        self._last_mode = camera_mode
 
     # ---------- STEREO ----------
     def stereo_depth(self, cx_left, cx_right, fx, baseline):
@@ -129,17 +215,14 @@ class CameraStereo:
     # ---------- APRILTAG ----------
     def _init_apriltag_detector(self):
         """
-        Create one Detector instance and keep it for the life of the process.
-        This avoids native heap crashes from repeated init/free cycles.
+        LAZY: only called when camera_mode == "AprilTag"
         """
         try:
             if self.at_detector is not None:
-                # do NOT del in a tight loop; but on init we can safely release
                 self.at_detector = None
                 gc.collect()
                 time.sleep(0.05)
 
-            # Parameters from AprilTagPoseEstimation.py for identical detection scheme
             self.at_detector = Detector(
                 families='tagStandard41h12',
                 nthreads=4,
@@ -150,7 +233,7 @@ class CameraStereo:
                 debug=0
             )
             self.at_detector_bad = False
-            print("[CAM] AprilTag Detector initialized (persistent, AprilTagPoseEstimation scheme).")
+            print("[CAM] AprilTag Detector initialized (lazy).")
         except Exception as e:
             print(f"[CAM] AprilTag Detector init failed: {e}")
             self.at_detector = None
@@ -193,11 +276,7 @@ class CameraStereo:
         return out
 
     def match_by_id(self, left_map, right_map):
-        matched = {}
-        for tag_id, L in left_map.items():
-            if tag_id in right_map:
-                matched[tag_id] = (L, right_map[tag_id])
-        return matched
+        return {tid: (L, right_map[tid]) for tid, L in left_map.items() if tid in right_map}
 
     def draw_tag_debug(self, frame, info, color=(0, 255, 0)):
         for tag_id, d in info.items():
@@ -210,68 +289,30 @@ class CameraStereo:
                 pts = corners.astype(np.int32)
                 cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
 
-    # ---------- YOLO POSE ----------
-    def process_pose(self, r, tag=""):
-        out = []
-        if r.keypoints is None or len(r.keypoints) == 0:
-            return out
-        kpts = r.keypoints.xy.cpu().numpy()
-        conf = r.keypoints.conf.cpu().numpy() if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None else None
-        clss = r.boxes.cls.cpu().numpy().astype(int) if r.boxes is not None else np.zeros(kpts.shape[0], dtype=int)
-        LSH, RSH, LHIP, RHIP = 5, 6, 11, 12
-        for i in range(kpts.shape[0]):
-            pts = kpts[i]
-            xs, ys = pts[:, 0], pts[:, 1]
-            cx, cy = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2
-            def valid(idx):
-                return conf[i, idx] > getattr(config, 'YOLO_KPT_CONF', 0.3) if conf is not None else np.isfinite(pts[idx]).all()
-            ang = None
-            if valid(LSH) and valid(RSH):
-                ang = math.atan2(pts[RSH][1] - pts[LSH][1], pts[RSH][0] - pts[LSH][0])
-            out.append({"cx": cx, "cy": cy, "ang": ang, "cls": int(clss[i])})
-        return out
-
-    def draw_pose_debug(self, frame, objs, color=(0,255,0)):
-        for o in objs:
-            cx, cy = int(o["cx"]), int(o["cy"])
-            cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
-            if o["ang"] is not None:
-                L = 50
-                x2 = int(cx + L * np.cos(o["ang"]))
-                y2 = int(cy + L * np.sin(o["ang"]))
-                cv2.arrowedLine(frame, (cx, cy), (x2, y2), color, 2)
-
-    # Draw raw YOLO keypoints/skeleton directly from Results (r)
-    def draw_pose_kpts(self, frame, r, kpt_thr=None, color_pts=(0, 0, 255), color_lines=(0, 255, 255)):
-        """
-        Draws the detected human pose keypoints (and a light skeleton) from Ultralytics Results.
-        Minimal: draws only the FIRST detection to match max_det=1.
-        """
+    # ---------- YOLO DRAW ----------
+    def draw_pose_kpts(self, frame, r, det_i: int = 0, kpt_thr=None):
         if kpt_thr is None:
-            kpt_thr = float(getattr(config, "YOLO_KPT_CONF", 0.3))
+            kpt_thr = self._yolo_kpt_conf
 
         if r is None or r.keypoints is None or len(r.keypoints) == 0:
             return
+        if det_i < 0 or det_i >= len(r.keypoints):
+            return
 
-        # First detection only (fast + matches max_det=1)
-        pts = r.keypoints.xy[0].cpu().numpy()  # (K, 2)
+        pts = r.keypoints.xy[det_i].cpu().numpy()
         conf = None
         if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None:
-            conf = r.keypoints.conf[0].cpu().numpy()  # (K,)
+            conf = r.keypoints.conf[det_i].cpu().numpy()
 
         def ok(i):
             return True if conf is None else (conf[i] >= kpt_thr)
 
-        # Draw keypoints
         for i in range(pts.shape[0]):
             x, y = pts[i]
-            if not np.isfinite(x) or not np.isfinite(y):
+            if not np.isfinite(x) or not np.isfinite(y) or not ok(i):
                 continue
-            if not ok(i):
-                continue
-            cv2.circle(frame, (int(x), int(y)), 3, color_pts, -1)
+            cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
 
-        # Draw a simple skeleton if it looks like COCO-17
         if pts.shape[0] >= 17:
             pairs = [
                 (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
@@ -280,89 +321,110 @@ class CameraStereo:
                 (0, 1), (0, 2), (1, 3), (2, 4)
             ]
             for a, b in pairs:
-                if a >= pts.shape[0] or b >= pts.shape[0]:
-                    continue
                 if not (ok(a) and ok(b)):
                     continue
                 xa, ya = pts[a]
                 xb, yb = pts[b]
                 if not (np.isfinite(xa) and np.isfinite(ya) and np.isfinite(xb) and np.isfinite(yb)):
                     continue
-                cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), color_lines, 2)
+                cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (0, 255, 255), 2)
 
-    # NEW: overlay text helper
-    def _overlay_text(self, frame, lines, org=(10, 30), line_h=26):
+    def _overlay_text(self, frame, lines, org=(10, 30), line_h=24):
         x, y = org
         for s in lines:
-            cv2.putText(frame, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.putText(frame, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
             y += line_h
 
     # ---------- MODES ----------
-    def _run_hunting(self, left, right):
+    def _run_hunting_batch2(self, left, right):
+        """
+        YOLO MODE:
+          - Lazy-init YOLO only when mode is active
+          - Single batched call: predict([left, right])
+        """
         if self.model is None:
             print("[CAM] Initializing YOLO model...")
             self.model = YOLO(self._resolved_model_path)
             print(f"[CAM] YOLO model loaded: {self._resolved_model_path}")
 
-        # --- batch=1 SAFE PATH ---
-        rL = self.model.predict(
-            source=left,
-            imgsz=config.IMGSZ,
-            conf=config.CONF,
+            dummy = np.zeros((self._yolo_imgsz, self._yolo_imgsz, 3), dtype=np.uint8)
+            _ = self.model.predict([dummy, dummy],
+                                   imgsz=self._yolo_imgsz,
+                                   conf=self._yolo_conf,
+                                   device=0,
+                                   max_det=self._yolo_max_det,
+                                   verbose=False)
+
+        results = self.model.predict(
+            source=[left, right],
+            imgsz=self._yolo_imgsz,
+            conf=self._yolo_conf,
             device=0,
-            max_det=1,
+            max_det=self._yolo_max_det,
             verbose=False
-        )[0]
+        )
 
-        rR = self.model.predict(
-            source=right,
-            imgsz=config.IMGSZ,
-            conf=config.CONF,
-            device=0,
-            max_det=1,
-            verbose=False
-        )[0]
+        rL = results[0] if len(results) > 0 else None
+        rR = results[1] if len(results) > 1 else None
 
-        objsL = self.process_pose(rL, "L")
-        objsR = self.process_pose(rR, "R")
+        #self.draw_pose_kpts(left, rL, det_i=0, kpt_thr=self._yolo_kpt_conf)
+        #self.draw_pose_kpts(right, rR, det_i=0, kpt_thr=self._yolo_kpt_conf)
 
-        # Draw pose on LEFT
-        self.draw_pose_kpts(left, rL)
+        def center_from_result(r):
+            if r is None or r.keypoints is None or len(r.keypoints) == 0:
+                return None
+            pts = r.keypoints.xy[0].cpu().numpy()
+            xs, ys = pts[:, 0], pts[:, 1]
+            if not np.isfinite(xs).any() or not np.isfinite(ys).any():
+                return None
+            cx = float(np.nanmin(xs) + np.nanmax(xs)) / 2.0
+            cy = float(np.nanmin(ys) + np.nanmax(ys)) / 2.0
+            return cx, cy
 
-        # Compute + overlay distance/angle if possible
+        cL = center_from_result(rL)
+        cR = center_from_result(rR)
+
         z = None
         angle = None
-        if objsL and objsR:
-            try:
-                z = float(self.stereo_depth(objsL[0]["cx"], objsR[0]["cx"], self.f, self.B))
-                angle = float(np.arctan((config.CAMERA_CENTER_X / 2 - objsL[0]["cx"]) / self.f * 3))
-            except Exception as e:
-                print(e)
+        if cL is not None and cR is not None:
+            cxL, cyL = cL
+            cxR, cyR = cR
+            z = self.stereo_depth(cxL, cxR, self.f, self.B)
 
-        # Cache for overlay even if payload isn't returned
+            w_half = left.shape[1]
+            angle = float(np.arctan(((w_half / 2.0) - cxL) / self.f))
+
         self._last_yolo_z = z
         self._last_yolo_angle = angle
 
-        # Overlay (only in YOLO mode)
-        lines = ["MODE: YOLO"]
-        if z is not None:
-            lines.append(f"Dist: {z:.2f}")
-        else:
-            lines.append("Dist: --")
-        if angle is not None:
-            lines.append(f"Angle: {angle:+.3f} rad")
-        else:
-            lines.append("Angle: --")
-        self._overlay_text(left, lines, org=(10, 30))
+        self._overlay_text(left, [
+            "MODE: YOLO (batch=2 L|R)",
+            f"z: {z:.2f} m" if z is not None else "z: --",
+            f"ang: {angle:+.3f} rad" if angle is not None else "ang: --",
+        ], org=(10, 30))
+        '''
+        self._overlay_text(left, [
+            "MODE: YOLO (batch=2)",
+            f"kpt_thr: {self._yolo_kpt_conf:.2f}",
+            f"conf: {self._yolo_conf:.2f}",
+        ], org=(10, 60))
+        '''
 
-        if objsL and objsR and (z is not None) and (angle is not None):
-            return build_vision_payload(objsL[0]["cx"], objsL[0]["cy"], objsL[0]["cls"], z, angle)
-
+        if cL is not None and cR is not None and (z is not None) and (angle is not None):
+            return build_vision_payload(cL[0], cL[1], 0, z, angle)
         return None
 
     def _run_tagging(self, left, right):
+        """
+        AprilTag MODE:
+          - Lazy-init Detector only when mode is active
+          - ONLY runs in AprilTag mode (never in Yolo mode)
+        """
+        if self.at_detector is None and not self.at_detector_bad:
+            self._init_apriltag_detector()
+
         try:
-            left_info  = self.detect_with_pose(self.at_detector, left,  self.f, self.f, config.TAG_SIZE_M)
+            left_info = self.detect_with_pose(self.at_detector, left, self.f, self.f, config.TAG_SIZE_M)
             right_info = self.detect_with_pose(self.at_detector, right, self.f, self.f, config.TAG_SIZE_M)
         except Exception as e:
             print(f"[CAM] AprilTag detect exception: {e}")
@@ -373,20 +435,22 @@ class CameraStereo:
             return None
 
         matched = self.match_by_id(left_info, right_info)
-        self.draw_tag_debug(left, left_info), self.draw_tag_debug(right, right_info)
+        self.draw_tag_debug(left, left_info)
+        self.draw_tag_debug(right, right_info)
 
         for tag_id, (L, R) in matched.items():
             cx_left = L["center"][0]
             cx_right = R["center"][0]
             z_m = self.stereo_depth(cx_left, cx_right, self.f, self.B)
-
             if z_m is not None:
                 angle = None
+                t = None
                 if L["t"] is not None:
                     t = L["t"].reshape(-1)
                     angle = math.atan2(-float(t[0]), float(t[2]))
                 corners = L.get("corners")
-                return build_vision_payload(L["center"][0], L["center"][1], tag_id, float(t[2]), angle, corners)
+                z_out = float(t[2]) if (t is not None and len(t) >= 3) else float(z_m)
+                return build_vision_payload(L["center"][0], L["center"][1], tag_id, z_out, angle, corners)
         return None
 
     def _run_idle(self, left, right):
@@ -395,22 +459,26 @@ class CameraStereo:
 
     # ---------- MAIN LOOP ----------
     def process_frame(self, camera_mode):
+        # Ensure only the right pipeline is alive for this mode
+        self._ensure_mode(camera_mode)
+        t0 = time. perf_counter()
         if self.cap is None:
             self.device = self.find_camera_device()
             if self.device is None:
                 print(f"[CAM] no camera device found. retrying in {config.OPEN_RETRY_SEC}s...")
                 time.sleep(config.OPEN_RETRY_SEC)
                 return None, None
-            self.cap = self.open_camera(self.device, config.IMAGE_RES[0], config.IMAGE_RES[1])
+
+            self.cap = self.open_camera(self.device, 640, 240)
             if self.cap is None:
                 print(f"[CAM] open failed for {self.device}. retrying in {config.OPEN_RETRY_SEC}s...")
                 time.sleep(config.OPEN_RETRY_SEC)
                 return None, None
+
             print(f"[CAM] opened {self.device}")
             self.consec_fail = 0
 
         ret, frame = self.cap.read()
-
         if not ret or frame is None:
             self.consec_fail += 1
             if self.consec_fail >= config.MAX_CONSEC_FAIL:
@@ -418,21 +486,23 @@ class CameraStereo:
                 self.release_camera()
                 time.sleep(config.REOPEN_BACKOFF_SEC)
             else:
-                time.sleep(0.02)
+                time.sleep(0.005)
             return None, None
 
         self.consec_fail = 0
 
         h_full, w_full = frame.shape[:2]
-        left  = frame[:, :w_full//2]
-        right = frame[:, w_full//2:]
+        mid = w_full // 2
+
+        left = frame[:, :mid].copy()
+        right = frame[:, mid:].copy()
 
         payload = None
         if camera_mode == "Yolo":
-            payload = self._run_hunting(left, right)
+            payload = self._run_hunting_batch2(left, right)
         elif camera_mode == "AprilTag":
             payload = self._run_tagging(left, right)
-        else:  # Rest
+        else:
             payload = self._run_idle(left, right)
 
         now = time.time()
@@ -445,4 +515,6 @@ class CameraStereo:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         vis = left
+        t1 = time.perf_counter()
+        #print("process frame:",(t1-t0)*1000)
         return vis, payload

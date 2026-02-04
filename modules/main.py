@@ -70,11 +70,12 @@ async def camera_loop(state: RobotState):
 
         if vis_frame is not None:
             cv2.imshow("Camera", vis_frame)
+            #print("showing")
         
         if cv2.waitKey(1) & 0xFF in [ord('q'), 27]: # ESC
             break
         
-        await asyncio.sleep(1 / 100) # Aim for 100 FPS, but processing will be the bottleneck
+        await asyncio.sleep(1 / 120) # Aim for 100 FPS, but processing will be the bottleneck
     
     cam.release_camera()
     cv2.destroyAllWindows()

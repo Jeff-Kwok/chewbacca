@@ -81,5 +81,5 @@ class STMModule:
                 #print(data.get("qx"),data.get("qy"),data.get("qz"))
                 self.calculate_all_values(data)
             except Exception as e:
-                print(f"[STM] Error: {e}")
-                await asyncio.sleep(0.1)
+                #print(f"[STM] Error: {e}")
+                await asyncio.sleep(0.025)

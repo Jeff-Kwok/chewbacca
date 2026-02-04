@@ -16,7 +16,7 @@ UDP_INTAKE_ROS2_PORT = 9543
 UDP_BROADCASTER_PORT_LIDAR = 9547
 UDP_BROADCASTER_PORT_STM_ODOM = 9548
 UDP_BROADCASTER_PORT_STM_IMU = 9549
-UDP_BROADCASTER_HZ = 50
+UDP_BROADCASTER_HZ = 60.0
 
 
 # Hardware Configuration
@@ -39,9 +39,9 @@ MAX_CONSEC_FAIL     = 10      # reopen after this many failed reads
 FIND_DEVICE_EVERY_N = 1       # re-scan devices each reconnect (1 = always)
 
 # YOLO behavior
-MODEL_PATH = "models/yolo11s-pose.engine"
+MODEL_PATH = "models/yolo11n-pose.engine"
 print(MODEL_PATH)
-IMGSZ      =640
+IMGSZ      = 320
 TAG_SIZE_M = 0.166
 CONF       = 0.35
 STEREO_FOCAL_LENGTH = 700*(1/2.3) # pixels
@@ -53,7 +53,7 @@ SELF_SEND_IP = "127.0.0.1"
 
 # Control Parameters
 JOY_TIMEOUT = 0.5
-CONTROL_HZ = 100.0
+CONTROL_HZ = 60.0
 CAMERA_CENTER_X = 320
 CAMERA_TOL = 40.0
 CAMERA_TIMEOUT = 0.3
