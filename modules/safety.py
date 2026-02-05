@@ -49,7 +49,7 @@ class SafetyModule:
         self.look_distance = 5.0
 
         # --- include all clusters within this radius (meters), regardless of intended angle ---
-        self.zone_radius = 1.5
+        self.zone_radius = 3.5
 
         # --- NEW: "visible arc" filter around intended ray ---
         self.visible_arc_deg = 25.0  # ±30° around intended_angle
@@ -60,7 +60,7 @@ class SafetyModule:
 
         # --- Cluster classification parameters ---
         self.classify_thresh = 0.12
-        self.classify_min_distance = 0.2
+        self.classify_min_distance = 1.0
 
         # --- Rectangle inflation (classification geometry) ---
         self.inflate_rect = 0.1
@@ -265,19 +265,19 @@ class SafetyModule:
                     inner_a.append(((float(p["a"]), float(p["r"]))))
 
         tol = np.deg2rad(1.5)
-        if abs(lx) >= 0.2 or abs(ly) >= 0.2:
-            if any(abs(self.angle_diff(a, intended_angle)) <= tol for a, r in outer_a):
-                # Looks for candidates that intake the function and combs for angles close to intended direction
-                cands = [(i, a, r) for i, (a, r) in enumerate(outer_a)
-                         if abs(self.angle_diff(a, intended_angle)) <= tol]
-                if not cands:
-                    idx = None
-                else:
-                    # if cands is not empty we comb through candidates to minimize the closest distance
-                    idx, a_best, r_best = min(cands, key=lambda t: t[2])  # minimize r
-                    # print(a_best)
-                    repulse_x = -np.cos(a_best) * self.repulsion_weight(r_best)
-                    repulse_y = -np.sin(a_best) * self.repulsion_weight(r_best)
+        #if abs(lx) >= 0.2 or abs(ly) >= 0.2:
+        if any(abs(self.angle_diff(a, intended_angle)) <= tol for a, r in outer_a):
+            # Looks for candidates that intake the function and combs for angles close to intended direction
+            cands = [(i, a, r) for i, (a, r) in enumerate(outer_a)
+                        if abs(self.angle_diff(a, intended_angle)) <= tol]
+            if not cands:
+                idx = None
+            else:
+                # if cands is not empty we comb through candidates to minimize the closest distance
+                idx, a_best, r_best = min(cands, key=lambda t: t[2])  # minimize r
+                # print(a_best)
+                repulse_x = -np.cos(a_best) * self.repulsion_weight(r_best)
+                repulse_y = -np.sin(a_best) * self.repulsion_weight(r_best)
 
         for a, r in inner_a:
             # print(a)
@@ -307,21 +307,22 @@ class SafetyModule:
         n_bins = int(n_bins) if int(n_bins) > 0 else 36
         ia = self.angle_wrap_2pi(float(intended_angle))
         bi = self.bin_index_for_angle(ia, n_bins)
-
+        # Angles_bins[bi] where bi = index intended angle liens in
         b = angle_bins[bi]
         a0 = float(b["a0"])
         a1 = float(b["a1"])
 
         blocked = []
         for p in (b.get("points", []) or []):
-            if p.get("label") == "intent":
-                continue
+            #if p.get("label") == "intent":
+            #    continue
             r = float(p.get("r", 999.0))
+            # All points as included by geometry not just clust4er points
             if r < float(clear_r):
                 blocked.append(self.angle_wrap_2pi(float(p.get("a", 0.0))))
 
         blocked = [a for a in blocked if (a >= a0 and a < a1)]
-
+        # if for that bin the angel is free we just return basic
         if not blocked:
             span = a1 - a0
             mid = a0 + 0.5 * span
@@ -526,16 +527,17 @@ class SafetyModule:
 
         angles = np.asarray(angles, dtype=float)
         ranges = np.asarray(ranges, dtype=float)
-
+        # Taking in all angles within that cluster
         in_window = np.array([self.angle_in_interval(a, a_lo, a_hi, padding=0) for a in angles], dtype=bool)
         a_seg = angles[in_window]
         r_seg = ranges[in_window]
 
         da = float(self.angle_diff(a_hi, a_lo))
+        # Double filtering incase -> angle diff is really small or small segment
         if (a_seg.size <= 5) or (abs(da) < 1e-3):
             return {"label": "degenerate", "n": int(a_seg.size), "reason": "no_points_or_da"}
-
-        if not np.any(r_seg <= self.look_distance):
+        
+        if not np.any(r_seg <= self.look_distance): 
             return {"label": "degenerate", "n": int(a_seg.size), "reason": "out_of_range"}
 
         try:
@@ -548,17 +550,17 @@ class SafetyModule:
 
         max_pos = float(np.max(resid))
         max_neg = float(np.min(resid))
-
+        # lol why we do this?
         p1, p2 = self.line_payload(cluster)
         length = float(self.polar_point_distance(p1[0], p1[1], p2[0], p2[1]))
-
+        # if it has points that are not closely bound than we know it's a rectangle
         if (max_pos + abs(max_neg)) > self.classify_thresh and length >= self.classify_min_distance:
             rect_xy = self.rect_xy_from_polar_cluster_bestfit(a_seg, r_seg)
             return {"label": "rectangle", "rect_xy": rect_xy, "n": int(a_seg.size)}
-
+        # we know one of the conditions is true we dont know which, if length is greater than that means the other condition is false
         if length >= self.classify_min_distance:
             return {"label": "line", "line": [p1, p2], "length": length, "n": int(a_seg.size)}
-
+        # There's residuals but the length of the cluster of points is not sufficient to declare a rectangle
         return {"label": "circle", "circle": self.circular_payload(cluster), "n": int(a_seg.size)}
 
     # ============================================================
@@ -672,25 +674,26 @@ class SafetyModule:
         """
         n_bins = int(n_bins) if int(n_bins) > 0 else 36
         edges = np.linspace(0.0, 2.0 * np.pi, n_bins + 1)
+        # storing bins and what clusters are in what bins
         bins = [{"bin_i": i, "a0": float(edges[i]), "a1": float(edges[i + 1]), "points": []} for i in range(n_bins)]
 
         for h in (hits or []):
             if not h:
                 continue
             info = (h or {}).get("info", {}) or {}
-            hid = (h or {}).get("hit_id", None)
+            #hid = (h or {}).get("hit_id", None)
             lab = info.get("label", "")
 
             pts = h.get("geom_pts", [])
             if pts is None:
                 pts = self.geometry_points_for_bins(info)  # fallback (should be rare)
-
+                # For each specific point on each geometry -> we add it to the specific bin it lies on
             for p in pts:
                 a = self.angle_wrap_2pi(p["a"])
                 bi = int((a / (2.0 * np.pi)) * n_bins)
                 bi = max(0, min(n_bins - 1, bi))
                 bins[bi]["points"].append({
-                    "hit_id": hid,
+                    #"hit_id": hid,
                     "label": lab,
                     "a": float(a),
                     "r": float(p["r"]),
@@ -699,6 +702,7 @@ class SafetyModule:
                 })
 
         # intent point
+        '''
         mag = float(np.hypot(float(lx), float(ly)))
         mag = max(0.0, min(1.0, mag))
         r_intent = float(mag * float(look_distance))
@@ -707,7 +711,7 @@ class SafetyModule:
         bi = int((a_intent / (2.0 * np.pi)) * n_bins)
         bi = max(0, min(n_bins - 1, bi))
         bins[bi]["points"].append({
-            "hit_id": 0,
+            #"hit_id": 0,
             "label": "intent",
             "a": float(a_intent),
             "r": float(r_intent),
@@ -716,13 +720,13 @@ class SafetyModule:
             "ly": float(ly),
             "mag": float(mag),
         })
-
+        '''
         return bins
 
     # ----------------- Joy frame <-> angle helpers -----------------
     def joy_to_angle(self, lx, ly):
         """NOTE: your convention is atan2(lx, ly) (swapped), keep it consistent."""
-        return float(np.arctan2(float(lx), float(ly)) % (2.0 * np.pi))
+        return float(np.arctan2(float(ly), float(lx)) % (2.0 * np.pi))
 
     def angle_to_joy(self, joy_theta, mag):
         """
@@ -741,7 +745,6 @@ class SafetyModule:
         async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port):
             print("[SAFETY] Listening for close obstacles and controller inputs...")
             lx = ly = 0.0
-            hit_id_counter = 1
 
             while True:
                 # 1) READ LIDAR PAYLOAD
@@ -760,48 +763,82 @@ class SafetyModule:
                     ly = float(getattr(self.state, "command_vector", {}).get("LY", 0.0))
 
                 # 3) COMPUTE INTENDED DIRECTION (MUST MATCH YOUR LIDAR FRAME)
-                joy_theta = self.joy_to_angle(lx, ly)
+                joy_theta = (np.arctan2(ly,-lx)-np.pi/2) % (2*np.pi)
                 intended_angle = (joy_theta + yaw) % (2 * np.pi)
+                print(f"yaw: {yaw:.2f} intended_angle: {intended_angle:.2f} joy_theta: {joy_theta:.2f}")
+
                 intended_magnitude = float(np.hypot(lx, ly))
                 intended_vector = [float(intended_angle), float(self.look_distance)]
 
                 # 4) Merge nearby clusters BEFORE filtering/classification
                 clusters = self.merge_nearby_clusters(clusters_raw)
-
+                #clusters = clusters_raw
                 # 5) FILTER + CLASSIFY OBSTACLES
+                close_mask = (ranges <= float(self.zone_radius)) # Boolean condition of what angles are close
+                #print(close_mask)
                 hits = []
-                for cl in clusters:
-                    rmin = self.cluster_min_range(cl, angles, ranges)
+                if np.any(close_mask):
+                    close_angles = angles[close_mask].astype(np.float32, copy=False)
 
-                    include_by_zone = (rmin <= float(self.zone_radius))
-                    include_by_visible_arc = self.cluster_overlaps_visible_arc(
-                        cl, intended_angle, arc_deg=float(self.visible_arc_deg)
-                    )
+                    a1 = np.asarray([cl[0][0] for cl in clusters], dtype=np.float32)  # hi
+                    a0 = np.asarray([cl[0][1] for cl in clusters], dtype=np.float32)  # lo
 
-                    if not (include_by_visible_arc or include_by_zone):
-                        continue
+                    normal = (a0 <= a1)
 
-                    info = self.classify_cluster(cl, angles, ranges)
-                    if info.get("label") == "degenerate":
-                        continue
+                    mask_normal = ((a1[None, :] - close_angles[:, None] >= 0) &
+                                (a0[None, :] - close_angles[:, None] <= 0))
 
-                    geom_pts = self.geometry_points_for_bins(info)
-                    hit = {
-                        "hit_id": int(hit_id_counter),
-                        "cluster": cl,
-                        "info": info,
-                        "geom_pts": geom_pts,
-                        "r_min": float(rmin),
-                        "include_by": {
-                            "visible_arc": bool(include_by_visible_arc),
-                            "zone": bool(include_by_zone),
-                        },
-                    }
-                    hit_id_counter += 1
-                    hits.append(hit)
+                    mask_wrap = ((close_angles[:, None] >= a0[None, :]) |
+                                (close_angles[:, None] <= a1[None, :]))
+
+                    mask = np.where(normal[None, :], mask_normal, mask_wrap)
+
+                    cluster_indices = np.where(np.any(mask, axis=0))[0]
+                    # Getting the index of clusters where cluster[i] is within range or in our intended angle
+                    for val in cluster_indices:
+                        cl = clusters[int(val)]
+                        '''
+                        # Checkinge every cluster for it's closest point
+                        rmin = self.cluster_min_range(cl, angles, ranges)
+
+                        include_by_zone = (rmin <= float(self.zone_radius))
+                        include_by_visible_arc = self.cluster_overlaps_visible_arc(
+                            cl, intended_angle, arc_deg=float(self.visible_arc_deg)
+                        )
+
+                        if not (include_by_visible_arc or include_by_zone):
+                            continue
+                            
+                        '''
+                        #rmin = self.cluster_min_range(cl, angles, ranges)
+                        info = self.classify_cluster(cl, angles, ranges)
+                        if info.get("label") == "degenerate":
+                            continue
+
+                        geom_pts = self.geometry_points_for_bins(info)
+                        hit = {
+                            #"hit_id": int(hit_id_counter),
+                            "cluster": cl,
+                            "info": info,
+                            "geom_pts": geom_pts,
+                            
+                            #"r_min": float(rmin),
+                            #"include_by": {
+                            #    "visible_arc": bool(include_by_visible_arc),
+                            #    "zone": bool(include_by_zone),
+                            #},
+                        }
+                        #hit_id_counter += 1
+                        hits.append(hit)
+                #elif np.all(angles >= self.zone_radius):
+                #    print("we're safe")
 
                 # 6) Build 0..2pi "number-line" bins using GEOMETRY points
-                '''
+                #'''
+                #print(hits)
+                #'''
+                # repulse_x, repulse_y are WORLD frame (unit)
+                # yaw is robot heading in world
                 n_bins = 36
                 angle_bins = self.build_angle_bins(
                     hits,
@@ -820,22 +857,28 @@ class SafetyModule:
                     min_span_deg=float(self.min_free_interval_deg),
                     clear_r=float(self.clear_radius),
                 )
-                '''
-                # repulse_x, repulse_y are WORLD frame (unit)
-                # yaw is robot heading in world
+                # controller input  = repulse_wx + lx
+                #'''
+                # 3) WORLD free-space vector (only if ok)
+                #free_wx = np.cos(free["mid"])
+                #free_wy = np.sin(free["mid"])
+                free_angle =(free["mid"] - yaw - np.pi/2) %(2*np.pi)
+                free_wx = np.cos(free_angle)
+                free_wy = -np.sin(free_angle)
+                #print(f"lx: {lx} ly: {ly}")
+                #print(f"yaw: {yaw:.2f} intended_angle: {intended_angle:.2f} joy_theta: {joy_theta:.2f} free_angle: {free_angle:.2f} freewx: {free_wx:.2f} freewy: {free_wy:.2f} ")
+                #print(intended_angle)
                 repulse_wx, repulse_wy = self.repulsion_against_intended(hits, intended_angle, lx, ly)
+                #print(free["mid"],free_wx,free_wy,repulse_wx,repulse_wy,intended_angle) # world coordinate
                 s = np.cos(yaw)
                 c = np.sin(yaw)
                 repulse_wx_corrected = (c*repulse_wx*-1 + s*repulse_wy)  
                 repulse_wy_corrected = (s*repulse_wx + c*repulse_wy)
-                
-                # controller input  = repulse_wx + lx
+                #print(f"repulse_wx: {repulse_wx_corrected:.2f} repulse_wy: {repulse_wy_corrected:.2f}")
+                lx_corr = free_wx + repulse_wx_corrected
+                ly_corr = free_wy + repulse_wy_corrected
+                print(f"lx_corr: {lx_corr:2f} ly_corr: {ly_corr:.2f}")
                 '''
-                # 3) WORLD free-space vector (only if ok)
-                free_wx = 0.0
-                free_wy = 0.0
-                free_wdy = 0.0
-                free_wdx = 0.0
                 if free.get("ok") and free.get("span", 0.0) > 0.25:
                     #span_norm = np.clip(free["span_deg"] / 45.0, 0.0, 1.0)  # 0..1
                     #w = np.log1p(9.0 * span_norm) / np.log1p(9.0)          # 0..1
@@ -849,7 +892,8 @@ class SafetyModule:
                     #print(free_wdx,free_wdy)
                 #print(f"free: {free['mid']:.2f} yaw: {yaw:.2f} intended: {intended_angle:.2f}") # We can take free_wx as our rtational vector
                 # 4) Combine in WORLD (this is the correct place)
-                '''
+
+                
                 kR = .80   # repulsion strength
                 kF = 0.32   # free-space strength (tune)
                 # 5) WORLD -> ROBOT for controller axes
@@ -868,7 +912,6 @@ class SafetyModule:
                                 #self.state.safe_axes["W"] = free_wx *-.625
                 # NOTE: no control outputs are produced anymore.
                 # This module only broadcasts a payload for your websocket visualizer.
-                '''
                 payload = {
                     "type": "safety",
                     "yaw": float(yaw),
@@ -878,7 +921,7 @@ class SafetyModule:
                     "intended_angle": float(intended_angle),
                     "intended_vector": intended_vector,
                     "intended_magnitude": float(intended_magnitude),
-                    #"intended_bin_i": int(self.bin_index_for_angle(intended_angle, n_bins)),
+                    "intended_bin_i": int(self.bin_index_for_angle(intended_angle, n_bins)),
 
                     # repulsion debug
                     "repulsion": {
@@ -891,13 +934,13 @@ class SafetyModule:
                     },
 
                     # free-space debug
-                    #"free_interval": free,
-                    #"min_free_interval_deg": float(self.min_free_interval_deg),
-                    #"clear_radius": float(self.clear_radius),
+                    "free_interval": free,
+                    "min_free_interval_deg": float(self.min_free_interval_deg),
+                    "clear_radius": float(self.clear_radius),
 
                     # filters / params
-                    "visible_arc_deg": float(self.visible_arc_deg),
-                    "zone_radius": float(self.zone_radius),
+                    #"visible_arc_deg": float(self.visible_arc_deg),
+                    #"zone_radius": float(self.zone_radius),
 
                     # cluster merge debug
                     "cluster_merge": {
@@ -909,9 +952,9 @@ class SafetyModule:
 
                     # hits + bins
                     "intended_hits": hits,
-                    #"angle_bins": angle_bins,
+                    "angle_bins": angle_bins,
                 }
 
                 await self.broadcast_safety(payload)
-                '''
+                #'''
                 await asyncio.sleep(0.10)  # ~20 Hz

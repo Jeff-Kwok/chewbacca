@@ -109,13 +109,13 @@ async def main():
     try:
         await asyncio.gather(
             ctrl_mod.run(),
-            camera_loop(state),
+            #camera_loop(state),
             core_mod.run(),
             stm_mod.run(),
             lidar_mod.run(),
             safety_mod.run(),
             broadcaster_mod.run(),
-            translation.run(),
+            #translation.run(),
         )
     finally:
         # Cleanup

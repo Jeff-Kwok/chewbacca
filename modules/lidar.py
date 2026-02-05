@@ -90,23 +90,23 @@ class LidarModule:
         return (a - b + math.pi) % (2.0 * math.pi) - math.pi
 
     def fill_angle_gaps(self, angles_rad, ranges_m,
-                        angle_step_deg=0.25,
-                        max_fill_gap_deg=15.0,
-                        dist_gap_m=1.0):
+                        angle_step_deg,
+                        max_fill_gap_deg,
+                        dist_gap_m):
         """
         Returns:
           filled_a (np.ndarray), filled_r (np.ndarray), clusters (list)
         MINIMAL CHANGE: returns numpy arrays (not python lists) to avoid list<->np churn.
         """
         if (angles_rad is None) or (ranges_m is None):
-            return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32), []
+            return np.asarray([], dtype=np.float16), np.asarray([], dtype=np.float16), []
         if len(angles_rad) < 2 or len(angles_rad) != len(ranges_m):
-            a = np.asarray(angles_rad, dtype=np.float32)
-            r = np.asarray(ranges_m, dtype=np.float32)
+            a = np.asarray(angles_rad, dtype=np.float16)
+            r = np.asarray(ranges_m, dtype=np.float16)
             return a, r, []
 
-        a = np.asarray(angles_rad, dtype=np.float32)
-        r = np.asarray(ranges_m, dtype=np.float32)
+        a = np.asarray(angles_rad, dtype=np.float16)
+        r = np.asarray(ranges_m, dtype=np.float16)
 
         order = np.argsort(a)
         a = a[order]
@@ -146,7 +146,7 @@ class LidarModule:
                 n = int(abs_da // angle_step)
                 # cap to prevent spikes (still "same behavior" for normal gaps)
                 if n > 20:
-                    n = 20
+                    n = 15
                 for k in range(1, n + 1):
                     t = k / (n + 1)
                     filled_a.append(a0 + da * t)
@@ -168,8 +168,8 @@ class LidarModule:
         finalize_run()
 
         return (
-            np.asarray(filled_a, dtype=np.float32),
-            np.asarray(filled_r, dtype=np.float32),
+            np.asarray(filled_a, dtype=np.float16),
+            np.asarray(filled_r, dtype=np.float16),
             clusters
         )
 
@@ -203,15 +203,14 @@ class LidarModule:
                         self._rx_points += len(scan)
 
                     scan_np = np.asarray(scan, dtype=np.float32)  # (N,3): [intensity, angle_deg, dist_mm]
-                    #intensity_all = scan_np[:, 0]
                     angles_deg_all = scan_np[:, 1]
                     dists_mm_all = scan_np[:, 2]
-
+                    #print(len(angles_deg_all))
                     ranges_m_all = dists_mm_all * 0.001
                     mask = (ranges_m_all > 0.0) & (ranges_m_all <= float(config.LIDAR_MAX_RANGE))
 
-                    ranges_m = ranges_m_all[mask]
-                    angles_rad = np.deg2rad(angles_deg_all[mask]).astype(np.float32, copy=False)
+                    ranges_m = np.round(ranges_m_all[mask],3).astype(np.float16,copy=False)
+                    angles_rad = np.round(np.deg2rad(angles_deg_all[mask]),3).astype(np.float16, copy=False)
 
                     # raw payload kept for ROS path (you said this is required)
                     self.state.lidar_payload = {
@@ -224,14 +223,14 @@ class LidarModule:
                     # ------ filled + yaw-adjusted for safety + websocket ------
                     yaw = math.radians(float(self.state.stm["yaw"]))  # scalar
                     angles_world = angles_rad + yaw
-                    angles_world = np.mod(angles_world, two_pi).astype(np.float32, copy=False)
+                    angles_world = np.mod(angles_world, two_pi).astype(np.float16, copy=False)
 
                     angles_filled, ranges_filled, clusters = self.fill_angle_gaps(
                         angles_world,
                         ranges_m,
-                        angle_step_deg=0.5,
+                        angle_step_deg=0.20,
                         max_fill_gap_deg=10.0,
-                        dist_gap_m=0.5
+                        dist_gap_m=1.0
                     )
 
                     # state for safety module (filled, yaw-adjusted)
@@ -241,7 +240,7 @@ class LidarModule:
                         "clusters": clusters,
                         "yaw": yaw
                     }
-                    '''
+                    #'''
 
                     # websocket payload (filled only)
                     if angles_filled.size > 0:
@@ -256,7 +255,7 @@ class LidarModule:
                         }
                         with self._ws_lock:
                             self._ws_latest = ws_payload
-                    '''
+                    #'''
                     # ----------------------------------------------------------
 
                     self._rate_tick()
@@ -291,8 +290,8 @@ class LidarModule:
         t.start()
 
         # start ws sender task (NEW, minimal)
-        #sender_task = asyncio.create_task(self._ws_sender_loop())
-        '''
+        sender_task = asyncio.create_task(self._ws_sender_loop())
+        #'''
         async with websockets.serve(self.ws_handler, "0.0.0.0", config.LIDAR_WS_PORT):
             try:
                 await asyncio.Future()
@@ -306,4 +305,4 @@ class LidarModule:
                 except Exception:
                     pass
                 t.join(timeout=2.0)
-        '''
+        #'''
